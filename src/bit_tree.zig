@@ -85,7 +85,10 @@ fn wordsForLevel(level: usize, bits: u32) usize {
 /// Total ids at the given layer: ceil(total_bits / span).
 /// Span is always a power of two (64^layer): shift instead of division.
 inline fn totalIdsForLayer(total_bits: u32, layer: u32) u64 {
-    if (total_bits == 0) return 0;
+    // Every caller proves total_bits != 0 first (step/stepWord/runAll early-return,
+    // non-empty levels imply total > 0): the branch was never taken on hot paths,
+    // so it is a Debug-only contract now and free in release.
+    std.debug.assert(total_bits != 0);
     const sh: u6 = @intCast(6 * layer);
     return (@as(u64, total_bits) + (@as(u64, 1) << sh) - 1) >> sh;
 }
@@ -235,12 +238,17 @@ pub const BitTree = struct {
 
     /// Writes one slot bit pair into parent words. Returns true when changed.
     inline fn writeSlot(parent_state: *u64, parent_mixed: *u64, slot: u32, s: bool, m: bool) bool {
-        const bit: u64 = @as(u64, 1) << @as(u6, @intCast(slot));
+        const slot6: u6 = @intCast(slot);
+        const bit: u64 = @as(u64, 1) << slot6;
         const old_s = (parent_state.* & bit) != 0;
         const old_m = (parent_mixed.* & bit) != 0;
         if (old_s == s and old_m == m) return false;
-        if (s) parent_state.* |= bit else parent_state.* &= ~bit;
-        if (m) parent_mixed.* |= bit else parent_mixed.* &= ~bit;
+        // Branchless insert (early-exit above stays: it avoids dirtying the
+        // cache line and stops propagation, a branchless write would lose that).
+        const s_bit: u64 = @as(u64, @intFromBool(s)) << slot6;
+        const m_bit: u64 = @as(u64, @intFromBool(m)) << slot6;
+        parent_state.* = (parent_state.* & ~bit) | s_bit;
+        parent_mixed.* = (parent_mixed.* & ~bit) | m_bit;
         return true;
     }
 
@@ -284,26 +292,82 @@ pub const BitTree = struct {
         const last_word: usize = @intCast((end - 1) >> 6);
         const leaves = self.levels.items[0].state.items;
         const want_one = state == .active;
-        var w: usize = first_word;
+        // Branchless select, loop-invariant: splat is all-ones for fill-1 and
+        // zero for fill-0, so new = (old & ~m) | (m & splat) covers both.
+        const splat: u64 = @as(u64, 0) -% @as(u64, @intFromBool(want_one));
         var changed: u32 = 0;
-        while (w <= last_word) : (w += 1) {
-            const m = rangeMask(w, start, end);
-            const old = leaves[w];
-            const new = if (want_one) old | m else old & ~m;
+        // Steady-split: edge words carry partial masks, middle full words need
+        // no rangeMask call at all (mask is all_ones, so new is splat).
+        if (first_word == last_word) {
+            const m = rangeMask(first_word, start, end);
+            const old = leaves[first_word];
+            const new = (old & ~m) | (m & splat);
             if (new != old) {
-                leaves[w] = new;
-                const added: u32 = @intCast(@popCount(new & ~old));
-                const removed: u32 = @intCast(@popCount(old & ~new));
-                self.active_count += added;
-                self.active_count -= removed;
+                leaves[first_word] = new;
+                // Bits flip in exactly one direction per call: single popCount.
+                const flipped: u32 = @intCast(@popCount(old ^ new));
+                if (want_one) {
+                    self.active_count += flipped;
+                } else {
+                    self.active_count -= flipped;
+                }
                 changed += 1;
+            }
+        } else {
+            // First partial word: bits [start&63, 64).
+            {
+                const m: u64 = all_ones << @as(u6, @intCast(start & 63));
+                const old = leaves[first_word];
+                const new = (old & ~m) | (m & splat);
+                if (new != old) {
+                    leaves[first_word] = new;
+                    const flipped: u32 = @intCast(@popCount(old ^ new));
+                    if (want_one) {
+                        self.active_count += flipped;
+                    } else {
+                        self.active_count -= flipped;
+                    }
+                    changed += 1;
+                }
+            }
+            // Middle full words.
+            var w: usize = first_word + 1;
+            while (w < last_word) : (w += 1) {
+                const old = leaves[w];
+                if (old != splat) {
+                    leaves[w] = splat;
+                    const flipped: u32 = @intCast(@popCount(old ^ splat));
+                    if (want_one) {
+                        self.active_count += flipped;
+                    } else {
+                        self.active_count -= flipped;
+                    }
+                    changed += 1;
+                }
+            }
+            // Last partial word: bits [0, end&63), full when end is aligned.
+            {
+                const end_lo: u64 = end & 63;
+                const m: u64 = if (end_lo == 0) all_ones else (((@as(u64, 1) << @as(u6, @intCast(end_lo))) - 1));
+                const old = leaves[last_word];
+                const new = (old & ~m) | (m & splat);
+                if (new != old) {
+                    leaves[last_word] = new;
+                    const flipped: u32 = @intCast(@popCount(old ^ new));
+                    if (want_one) {
+                        self.active_count += flipped;
+                    } else {
+                        self.active_count -= flipped;
+                    }
+                    changed += 1;
+                }
             }
         }
         if (changed == 0) return;
         if (changed > node_fanout * 4) {
             self.rebuildSummaries();
         } else {
-            w = first_word;
+            var w: usize = first_word;
             while (w <= last_word) : (w += 1) {
                 self.propagateFromLeafWord(w);
             }
@@ -491,12 +555,23 @@ pub const BitTree = struct {
         if (len == 0) return 0;
         const leaves = self.levels.items[0].state.items;
         const end: u64 = @as(u64, start) + len;
-        var w: usize = @intCast(start >> 6);
+        const first_word: usize = @intCast(start >> 6);
         const last_word: usize = @intCast((end - 1) >> 6);
         var acc: u32 = 0;
-        while (w <= last_word) : (w += 1) {
-            acc += @intCast(@popCount(leaves[w] & rangeMask(w, start, end)));
+        // Steady-split: single rangeMask call for edge words, bare popCount
+        // for middle full words (no mask AND at all).
+        if (first_word == last_word) {
+            acc += @intCast(@popCount(leaves[first_word] & rangeMask(first_word, start, end)));
+            return acc;
         }
+        acc += @intCast(@popCount(leaves[first_word] & (all_ones << @as(u6, @intCast(start & 63)))));
+        var w: usize = first_word + 1;
+        while (w < last_word) : (w += 1) {
+            acc += @intCast(@popCount(leaves[w]));
+        }
+        const end_lo: u64 = end & 63;
+        const last_mask: u64 = if (end_lo == 0) all_ones else (((@as(u64, 1) << @as(u6, @intCast(end_lo))) - 1));
+        acc += @intCast(@popCount(leaves[last_word] & last_mask));
         return acc;
     }
 
@@ -653,14 +728,14 @@ pub fn LayerBitsIterator(
     return struct {
         inline fn emitOne(ctx: Ctx, id_scan: u64, comptime out_l: u32, comptime cb: ?fn (Ctx, u32) bool, total_out: u64) bool {
             const f = cb orelse return true;
-            const d: u32 = scan_layer - out_l;
-            if (d == 0) {
+            const d: u32 = comptime (scan_layer - out_l);
+            if (comptime d == 0) {
                 if (id_scan >= total_out) return true;
                 return f(ctx, @intCast(id_scan));
             }
-            const sh: u6 = @intCast(6 * d);
+            const sh: u6 = comptime @intCast(6 * d);
+            const cnt: u64 = comptime (@as(u64, 1) << sh);
             const base: u64 = id_scan << sh;
-            const cnt: u64 = @as(u64, 1) << sh;
             // Fast path: fully covered range needs no per-element bounds check,
             // which keeps the loop vectorizable.
             if (base + cnt <= total_out) {
@@ -682,14 +757,14 @@ pub fn LayerBitsIterator(
 
         inline fn emitMixedOne(ctx: Ctx, tree: *const BitTree, id_scan: u64, comptime out_l: u32, comptime cb: ?fn (Ctx, *const BitTree, u32) bool, total_out: u64) bool {
             const f = cb orelse return true;
-            const d: u32 = scan_layer - out_l;
-            if (d == 0) {
+            const d: u32 = comptime (scan_layer - out_l);
+            if (comptime d == 0) {
                 if (id_scan >= total_out) return true;
                 return f(ctx, tree, @intCast(id_scan));
             }
-            const sh: u6 = @intCast(6 * d);
+            const sh: u6 = comptime @intCast(6 * d);
+            const cnt: u64 = comptime (@as(u64, 1) << sh);
             const base: u64 = id_scan << sh;
-            const cnt: u64 = @as(u64, 1) << sh;
             if (base + cnt <= total_out) {
                 var k: u64 = 0;
                 while (k < cnt) : (k += 1) {
@@ -708,11 +783,13 @@ pub fn LayerBitsIterator(
         }
 
         inline fn rangeMask64(lo: u64, hi: u64) u64 {
-            const width: u32 = @intCast(hi - lo);
-            if (width == 64) return all_ones;
-            const w6: u6 = @intCast(width);
+            // Caller guarantees 0 <= lo < hi <= 64. Full mask with the low
+            // (64-width) bits shifted out, then positioned at lo: width==64
+            // falls out as (~0 >> 0) << 0, no special case, no UB.
+            const width: u64 = hi - lo;
+            const w6: u6 = @intCast(64 - width);
             const l6: u6 = @intCast(lo);
-            return (((@as(u64, 1) << w6) - 1) << l6);
+            return (((~@as(u64, 0)) >> w6) << l6);
         }
 
         // Deep-mixed jump is only valid when the final output is raw bits.
@@ -720,68 +797,85 @@ pub fn LayerBitsIterator(
         // coarse `out_layers` keep the old descent to preserve batching.
         const deep_enabled: bool = (scan_layer >= 2) and (on_mixed != null) and (out_layers.active == 0) and (out_layers.inactive == 0);
 
-        // Direct leaf scan for one deep-mixed slot range.
-        // Covers `leaf_cnt` consecutive leaf words from `leaf_base`, clipped
-        // to the real leaf count; tail word masked by lastLeafMask.
-        // Uses the same single/dual polarity logic as BitsetIterator.
-        inline fn scanDeepLeafRange(ctx: Ctx, tree: *const BitTree, leaf_base: u64, leaf_cnt: u64) bool {
-            if (leaf_cnt == 0) return true;
-            if (tree.levels.items.len == 0) return true;
-            const leaves = tree.levels.items[0].state.items;
-            if (leaves.len == 0) return true;
-            const total: u32 = tree.total_bits;
-            if (total == 0) return true;
-            const total_words: u64 = (@as(u64, total) + 63) >> 6;
-            if (leaf_base >= total_words) return true;
-            var end: u64 = leaf_base + leaf_cnt;
-            if (end > total_words) end = total_words;
-            var lw_idx: u64 = leaf_base;
-            while (lw_idx < end) : (lw_idx += 1) {
-                const wi: usize = @intCast(lw_idx);
-                const lw: u64 = leaves[wi];
-                const allow: u64 = if (wi + 1 == leaves.len) lastLeafMask(total) else all_ones;
-                if (allow == 0) continue;
-                const base_bit: u64 = lw_idx * 64;
-                if (on_inactive == null) {
-                    var bits: u64 = lw & allow;
-                    while (bits != 0) {
-                        const b: u32 = @ctz(bits);
-                        bits &= bits - 1;
-                        if (on_active) |f| {
-                            if (!f(ctx, @intCast(base_bit + b))) return false;
-                        }
+        // Single leaf word emitter with pre-resolved `allow` (no tail branch).
+        // Shared by the deep jump and the steady/tail split below.
+        inline fn emitLeafWord(ctx: Ctx, lw: u64, base_bit: u64, allow: u64) bool {
+            if (allow == 0) return true;
+            if (on_inactive == null) {
+                var bits: u64 = lw & allow;
+                while (bits != 0) {
+                    const b: u32 = @ctz(bits);
+                    bits &= bits - 1;
+                    if (on_active) |f| {
+                        if (!f(ctx, @intCast(base_bit + b))) return false;
                     }
-                } else if (on_active == null) {
-                    var bits: u64 = ~lw & allow;
-                    while (bits != 0) {
-                        const b: u32 = @ctz(bits);
-                        bits &= bits - 1;
-                        if (on_inactive) |f| {
-                            if (!f(ctx, @intCast(base_bit + b))) return false;
-                        }
+                }
+                return true;
+            }
+            if (on_active == null) {
+                var bits: u64 = ~lw & allow;
+                while (bits != 0) {
+                    const b: u32 = @ctz(bits);
+                    bits &= bits - 1;
+                    if (on_inactive) |f| {
+                        if (!f(ctx, @intCast(base_bit + b))) return false;
+                    }
+                }
+                return true;
+            }
+            var wanted: u64 = allow;
+            while (wanted != 0) {
+                const b: u32 = @ctz(wanted);
+                wanted &= wanted - 1;
+                const is_active = ((lw >> @as(u6, @intCast(b))) & 1) == 1;
+                if (is_active) {
+                    if (on_active) |f| {
+                        if (!f(ctx, @intCast(base_bit + b))) return false;
                     }
                 } else {
-                    var wanted: u64 = allow;
-                    while (wanted != 0) {
-                        const b: u32 = @ctz(wanted);
-                        wanted &= wanted - 1;
-                        const is_active = ((lw >> @as(u6, @intCast(b))) & 1) == 1;
-                        if (is_active) {
-                            if (on_active) |f| {
-                                if (!f(ctx, @intCast(base_bit + b))) return false;
-                            }
-                        } else {
-                            if (on_inactive) |f| {
-                                if (!f(ctx, @intCast(base_bit + b))) return false;
-                            }
-                        }
+                    if (on_inactive) |f| {
+                        if (!f(ctx, @intCast(base_bit + b))) return false;
                     }
                 }
             }
             return true;
         }
 
-        inline fn processWord(ctx: Ctx, tree: *const BitTree, st_items: []const u64, mx_items: []const u64, w: usize, allowed: u64, t_a: u64, t_i: u64, t_m: u64) bool {
+        // Deep range scan over prepared leaf storage: steady full words with
+        // `all_ones`, tree-tail word once with `tailMask`. No per-word branch.
+        inline fn scanDeepPrepared(ctx: Ctx, leaves: []const u64, total_words: u64, tailMask: u64, leaf_base: u64, leaf_cnt: u64) bool {
+            if (leaf_cnt == 0) return true;
+            if (total_words == 0) return true;
+            if (leaves.len == 0) return true;
+            if (leaf_base >= total_words) return true;
+            var end: u64 = leaf_base + leaf_cnt;
+            if (end > total_words) end = total_words;
+            if (end > leaves.len) end = leaves.len;
+            const eff: u64 = @min(total_words, @as(u64, leaves.len));
+            if (eff == 0) return true;
+            // Steady part excludes the tree-tail word unless it is full.
+            const last_idx: u64 = eff - 1;
+            const steady_end: u64 = if (tailMask == all_ones) end else @min(end, last_idx);
+            var lw_idx: u64 = leaf_base;
+            while (lw_idx < steady_end) : (lw_idx += 1) {
+                const wi: usize = @intCast(lw_idx);
+                if (!emitLeafWord(ctx, leaves[wi], lw_idx << 6, all_ones)) return false;
+            }
+            if (end > last_idx and last_idx >= leaf_base and tailMask != all_ones) {
+                const wi: usize = @intCast(last_idx);
+                if (!emitLeafWord(ctx, leaves[wi], last_idx << 6, tailMask)) return false;
+            } else {
+                // Tail is full or not in range: remaining words (at most one)
+                // are full. Handles tailMask==all_ones without extra branch above.
+                while (lw_idx < end) : (lw_idx += 1) {
+                    const wi: usize = @intCast(lw_idx);
+                    if (!emitLeafWord(ctx, leaves[wi], lw_idx << 6, all_ones)) return false;
+                }
+            }
+            return true;
+        }
+
+        inline fn processWord(ctx: Ctx, tree: *const BitTree, st_items: []const u64, mx_items: []const u64, w: usize, allowed: u64, total: u32) bool {
             if (allowed == 0) return true;
             const st: u64 = st_items[w];
             const mx: u64 = mx_items[w];
@@ -789,8 +883,11 @@ pub fn LayerBitsIterator(
             const a_all: u64 = st & ~mx & allowed;
             // Fast paths for single-polarity scans without descent: every wanted
             // slot shares one class, so per-slot classification is skipped.
+            // Totals are computed lazily: untouched polarities cost zero.
             if (on_mixed == null) {
                 if (on_inactive == null) {
+                    if (a_all == 0) return true;
+                    const t_a: u64 = totalIdsForLayer(total, out_layers.active);
                     var rest: u64 = a_all;
                     while (rest != 0) {
                         const s: u32 = @ctz(rest);
@@ -800,7 +897,10 @@ pub fn LayerBitsIterator(
                     return true;
                 }
                 if (on_active == null) {
-                    var rest: u64 = allowed & ~m_all & ~a_all;
+                    const i_all: u64 = allowed & ~m_all & ~a_all;
+                    if (i_all == 0) return true;
+                    const t_i: u64 = totalIdsForLayer(total, out_layers.inactive);
+                    var rest: u64 = i_all;
                     while (rest != 0) {
                         const s: u32 = @ctz(rest);
                         rest &= rest - 1;
@@ -812,44 +912,68 @@ pub fn LayerBitsIterator(
             if (comptime deep_enabled) {
                 const deep_all: u64 = st & mx & allowed;
                 if (deep_all != 0) {
-                    // Whole-word deep: one contiguous leaf range, no per-slot dispatch.
+                    const leaves = tree.levels.items[0].state.items;
+                    if (leaves.len == 0) return true;
+                    const total_words: u64 = (@as(u64, total) + 63) >> 6;
+                    const tailMask: u64 = lastLeafMask(total);
+                    // Whole-word deep: one contiguous leaf range, no totals needed.
                     if (deep_all == allowed) {
-                        const sh_word: u6 = @intCast(6 * scan_layer);
+                        const sh_word: u6 = comptime @intCast(6 * scan_layer);
                         const leaf_base: u64 = @as(u64, w) << sh_word;
-                        const leaf_cnt: u64 = @as(u64, 1) << sh_word;
-                        if (!scanDeepLeafRange(ctx, tree, leaf_base, leaf_cnt)) return false;
+                        const leaf_cnt: u64 = comptime (@as(u64, 1) << sh_word);
+                        if (!scanDeepPrepared(ctx, leaves, total_words, tailMask, leaf_base, leaf_cnt)) return false;
                         return true;
                     }
                     // Partially deep word: keep ascending order, deep slots jump,
-                    // the rest use the normal mixed/uniform path.
-                    var rest: u64 = 0;
+                    // the rest use the normal mixed/uniform path. Totals only
+                    // for the classes actually present.
+                    const shallow_all: u64 = m_all & ~deep_all;
+                    var t_m: u64 = undefined;
+                    var need_m: bool = false;
+                    if (on_mixed != null and shallow_all != 0) {
+                        t_m = totalIdsForLayer(total, out_layers.mixed);
+                        need_m = true;
+                    }
+                    var t_a2: u64 = undefined;
+                    if (on_active != null and a_all != 0) t_a2 = totalIdsForLayer(total, out_layers.active);
+                    var t_i2: u64 = undefined;
+                    const i_all: u64 = allowed & ~m_all & ~a_all;
+                    if (on_inactive != null and i_all != 0) t_i2 = totalIdsForLayer(total, out_layers.inactive);
+                    const sh_slot: u6 = comptime @intCast(6 * (scan_layer - 1));
+                    const slot_cnt: u64 = comptime (@as(u64, 1) << sh_slot);
+                    var rest: u64 = m_all;
                     if (on_active != null) rest |= a_all;
-                    if (on_inactive != null) rest |= allowed & ~m_all & ~a_all;
-                    rest |= m_all;
-                    const sh_slot: u6 = @intCast(6 * (scan_layer - 1));
-                    const slot_cnt: u64 = @as(u64, 1) << sh_slot;
+                    if (on_inactive != null) rest |= i_all;
                     while (rest != 0) {
                         const s: u32 = @ctz(rest);
                         rest &= rest - 1;
                         const bitm: u64 = @as(u64, 1) << @as(u6, @intCast(s));
                         const id_scan: u64 = @as(u64, w) * 64 + s;
                         if ((deep_all & bitm) != 0) {
-                            if (!scanDeepLeafRange(ctx, tree, id_scan << sh_slot, slot_cnt)) return false;
-                        } else if ((m_all & bitm) != 0) {
+                            if (!scanDeepPrepared(ctx, leaves, total_words, tailMask, id_scan << sh_slot, slot_cnt)) return false;
+                        } else if (need_m and (shallow_all & bitm) != 0) {
                             if (!emitMixedOne(ctx, tree, id_scan, out_layers.mixed, on_mixed, t_m)) return false;
                         } else if (on_active != null and (a_all & bitm) != 0) {
-                            if (!emitOne(ctx, id_scan, out_layers.active, on_active, t_a)) return false;
+                            if (!emitOne(ctx, id_scan, out_layers.active, on_active, t_a2)) return false;
                         } else if (on_inactive != null) {
-                            if (!emitOne(ctx, id_scan, out_layers.inactive, on_inactive, t_i)) return false;
+                            if (!emitOne(ctx, id_scan, out_layers.inactive, on_inactive, t_i2)) return false;
                         }
                     }
                     return true;
                 }
             }
+            // Generic path: totals only for classes actually present.
+            var t_a: u64 = undefined;
+            if (on_active != null and a_all != 0) t_a = totalIdsForLayer(total, out_layers.active);
+            var t_m: u64 = undefined;
+            if (on_mixed != null and m_all != 0) t_m = totalIdsForLayer(total, out_layers.mixed);
+            var t_i: u64 = undefined;
+            const i_all: u64 = allowed & ~m_all & ~a_all;
+            if (on_inactive != null and i_all != 0) t_i = totalIdsForLayer(total, out_layers.inactive);
             var rest: u64 = 0;
             if (on_mixed != null) rest |= m_all;
             if (on_active != null) rest |= a_all;
-            if (on_inactive != null) rest |= allowed & ~m_all & ~a_all;
+            if (on_inactive != null) rest |= i_all;
             while (rest != 0) {
                 const s: u32 = @ctz(rest);
                 rest &= rest - 1;
@@ -874,15 +998,13 @@ pub fn LayerBitsIterator(
             if (scan_layer >= tree.levels.items.len) return true;
             const total_in: u64 = totalIdsForLayer(total, in_layer);
             if (@as(u64, id) >= total_in) return true;
-            const d_in: u32 = in_layer - scan_layer;
-            const base: u64 = if (d_in == 0) id else @as(u64, id) << @as(u6, @intCast(6 * d_in));
-            var cnt: u64 = if (d_in == 0) 1 else @as(u64, 1) << @as(u6, @intCast(6 * d_in));
+            const d_in: u32 = comptime (in_layer - scan_layer);
+            const sh_in: u6 = comptime if (d_in == 0) @as(u6, 0) else @intCast(6 * d_in);
+            const base: u64 = if (comptime d_in == 0) id else @as(u64, id) << sh_in;
+            var cnt: u64 = if (comptime d_in == 0) 1 else comptime (@as(u64, 1) << sh_in);
             const total_scan: u64 = totalIdsForLayer(total, scan_layer);
             if (base >= total_scan) return true;
             if (base + cnt > total_scan) cnt = total_scan - base;
-            const t_a: u64 = totalIdsForLayer(total, out_layers.active);
-            const t_i: u64 = totalIdsForLayer(total, out_layers.inactive);
-            const t_m: u64 = totalIdsForLayer(total, out_layers.mixed);
             const st_items: []const u64 = tree.levels.items[scan_layer].state.items;
             const mx_items: []const u64 = tree.levels.items[scan_layer].mixed.items;
             const words: usize = st_items.len;
@@ -900,7 +1022,7 @@ pub fn LayerBitsIterator(
                 const trem: u64 = if (w_base >= total_scan) 0 else total_scan - w_base;
                 if (trem == 0) continue;
                 allowed &= slotsValidMask(@min(trem, @as(u64, 64)));
-                if (!processWord(ctx, tree, st_items, mx_items, w, allowed, t_a, t_i, t_m)) return false;
+                if (!processWord(ctx, tree, st_items, mx_items, w, allowed, total)) return false;
             }
             return true;
         }
@@ -920,12 +1042,9 @@ pub fn LayerBitsIterator(
             const total_scan: u64 = totalIdsForLayer(total, scan_layer);
             const base: u64 = @as(u64, wi) * 64;
             if (base >= total_scan) return true;
-            const t_a: u64 = totalIdsForLayer(total, out_layers.active);
-            const t_i: u64 = totalIdsForLayer(total, out_layers.inactive);
-            const t_m: u64 = totalIdsForLayer(total, out_layers.mixed);
             const trem: u64 = total_scan - base;
             const allowed: u64 = slotsValidMask(@min(trem, @as(u64, 64)));
-            return processWord(ctx, tree, st_items, mx_items, wi, allowed, t_a, t_i, t_m);
+            return processWord(ctx, tree, st_items, mx_items, wi, allowed, total);
         }
 
         /// Processes every word at `scan_layer` in ascending order.
@@ -935,9 +1054,6 @@ pub fn LayerBitsIterator(
             if (total == 0) return true;
             if (scan_layer >= tree.levels.items.len) return true;
             const total_scan: u64 = totalIdsForLayer(total, scan_layer);
-            const t_a: u64 = totalIdsForLayer(total, out_layers.active);
-            const t_i: u64 = totalIdsForLayer(total, out_layers.inactive);
-            const t_m: u64 = totalIdsForLayer(total, out_layers.mixed);
             const st_items: []const u64 = tree.levels.items[scan_layer].state.items;
             const mx_items: []const u64 = tree.levels.items[scan_layer].mixed.items;
             const words: usize = st_items.len;
@@ -946,12 +1062,12 @@ pub fn LayerBitsIterator(
             const full_words: usize = @intCast(total_scan >> 6);
             const steady: usize = @min(full_words, words);
             while (w < steady) : (w += 1) {
-                if (!processWord(ctx, tree, st_items, mx_items, w, all_ones, t_a, t_i, t_m)) return false;
+                if (!processWord(ctx, tree, st_items, mx_items, w, all_ones, total)) return false;
             }
             if (w < words) {
                 const base: u64 = @as(u64, w) * 64;
                 if (base < total_scan) {
-                    if (!processWord(ctx, tree, st_items, mx_items, w, slotsValidMask(total_scan - base), t_a, t_i, t_m)) return false;
+                    if (!processWord(ctx, tree, st_items, mx_items, w, slotsValidMask(total_scan - base), total)) return false;
                 }
             }
             return true;
@@ -997,7 +1113,7 @@ pub fn BitsetIterator(
                 }
                 return true;
             }
-            var wanted: u64 = (lw & allowed) | (~lw & allowed);
+            var wanted: u64 = allowed;
             while (wanted != 0) {
                 const s: u32 = @ctz(wanted);
                 wanted &= wanted - 1;
@@ -1023,12 +1139,15 @@ pub fn BitsetIterator(
             if (tree.levels.items.len == 0) return true;
             const total_in: u64 = totalIdsForLayer(total, in_layer);
             if (@as(u64, id) >= total_in) return true;
-            const sh: u6 = @intCast(6 * in_layer);
-            const base: u64 = if (in_layer == 0) id else @as(u64, id) << sh;
-            var cnt: u64 = if (in_layer == 0) 1 else (@as(u64, 1) << sh);
+            const sh: u6 = comptime @intCast(6 * in_layer);
+            const cnt0: u64 = comptime (@as(u64, 1) << sh);
+            const base: u64 = if (comptime in_layer == 0) id else @as(u64, id) << sh;
+            var cnt: u64 = if (comptime in_layer == 0) 1 else cnt0;
             if (base >= total) return true;
             if (base + cnt > total) cnt = @as(u64, total) - base;
             const leaves = tree.levels.items[0].state.items;
+            if (leaves.len == 0) return true;
+            const tailMask: u64 = lastLeafMask(total);
             const w_first: usize = @intCast(base >> 6);
             const w_last: usize = @intCast((base + cnt - 1) >> 6);
             var w: usize = w_first;
@@ -1041,7 +1160,7 @@ pub fn BitsetIterator(
                 if (hi <= lo) continue;
                 const width: u32 = @intCast(hi - lo);
                 var allowed: u64 = if (width == 64) all_ones else (((@as(u64, 1) << @as(u6, @intCast(width))) - 1) << @as(u6, @intCast(lo)));
-                if (w + 1 == leaves.len) allowed &= lastLeafMask(total);
+                if (w + 1 == leaves.len) allowed &= tailMask;
                 if (!processLeafWord(ctx, leaves, w, allowed)) return false;
             }
             return true;
@@ -1067,10 +1186,16 @@ pub fn BitsetIterator(
             if (total == 0) return true;
             if (tree.levels.items.len == 0) return true;
             const leaves = tree.levels.items[0].state.items;
+            if (leaves.len == 0) return true;
+            // Steady full words without per-word tail branch; tail once.
+            const tailMask: u64 = lastLeafMask(total);
             var w: usize = 0;
-            while (w < leaves.len) : (w += 1) {
-                const valid: u64 = if (w + 1 == leaves.len) lastLeafMask(total) else all_ones;
-                if (!processLeafWord(ctx, leaves, w, valid)) return false;
+            const steady: usize = if (tailMask == all_ones) leaves.len else leaves.len - 1;
+            while (w < steady) : (w += 1) {
+                if (!processLeafWord(ctx, leaves, w, all_ones)) return false;
+            }
+            if (w < leaves.len) {
+                if (!processLeafWord(ctx, leaves, w, tailMask)) return false;
             }
             return true;
         }
@@ -1195,11 +1320,12 @@ pub const FlatBitSet = struct {
     fn countRangeActive(self: *const Self, start: u32, len: u32) u32 {
         if (len == 0) return 0;
         const end: u64 = @as(u64, start) + len;
-        var w: usize = @intCast(start >> 6);
+        const first_word: usize = @intCast(start >> 6);
         const last_word: usize = @intCast((end - 1) >> 6);
         var acc: u32 = 0;
-        while (w <= last_word) : (w += 1) {
-            const ws: u64 = @as(u64, w) * 64;
+        // Steady-split: edge masks once, middle words as bare popCounts.
+        if (first_word == last_word) {
+            const ws: u64 = @as(u64, first_word) * 64;
             var m: u64 = all_ones;
             if (@as(u64, start) > ws) {
                 const lo: u6 = @intCast(@as(u64, start) - ws);
@@ -1207,10 +1333,19 @@ pub const FlatBitSet = struct {
             }
             if (end - ws < 64) {
                 const hi: u6 = @intCast(end - ws);
-                m &= (@as(u64, 1) << hi) - 1;
+                m &= ((@as(u64, 1) << hi) - 1);
             }
-            acc += @intCast(@popCount(self.words.items[w] & m));
+            acc += @intCast(@popCount(self.words.items[first_word] & m));
+            return acc;
         }
+        acc += @intCast(@popCount(self.words.items[first_word] & (all_ones << @as(u6, @intCast(start & 63)))));
+        var w: usize = first_word + 1;
+        while (w < last_word) : (w += 1) {
+            acc += @intCast(@popCount(self.words.items[w]));
+        }
+        const end_lo: u64 = end & 63;
+        const last_mask: u64 = if (end_lo == 0) all_ones else (((@as(u64, 1) << @as(u6, @intCast(end_lo))) - 1));
+        acc += @intCast(@popCount(self.words.items[last_word] & last_mask));
         return acc;
     }
 };
