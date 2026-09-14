@@ -1,6 +1,8 @@
 /// BitTree with dual-mask hierarchy for layer-by-layer slice generation.
 /// Level 0 holds raw bits (64 per u64). Levels >=1 hold pairs:
-/// state word (1 == uniform active) + mixed word (1 == mixed region).
+/// state word + mixed word. Encoding per slot: (0,0)=uniform inactive,
+/// (1,0)=uniform active, (0,1)=shallow mixed, (1,1)=deep mixed
+/// (whole subtree fragmented down to L0, safe to jump straight to leaves).
 /// One word pair covers 64 child regions, fanout 64.
 const std = @import("std");
 /// Memory allocator type used for all tree allocations.
@@ -202,23 +204,32 @@ pub const BitTree = struct {
     }
 
     /// Summarizes one leaf word into (state_bit, mixed_bit) for its parent slot.
+    /// Encoding: (0,0)=uniform inactive, (1,0)=uniform active,
+    /// (0,1)=shallow mixed, (1,1)=deep mixed (fully fragmented).
+    /// L1 mixed slots are always deep: below them are only raw bits,
+    /// so there is no intermediate layer left to skip.
     const SlotSummary = struct { s: bool, m: bool };
     inline fn summarizeLeafBits(word: u64, valid_mask: u64) SlotSummary {
         const w = word & valid_mask;
         if (w == 0) return .{ .s = false, .m = false };
         if (w == valid_mask) return .{ .s = true, .m = false };
-        return .{ .s = false, .m = true };
+        return .{ .s = true, .m = true };
     }
 
     /// Summarizes one child summary word (pair) into (state_bit, mixed_bit).
     /// Child covers up to 64 slots, only `valid` of them are real.
+    /// Deep mixed (1,1) means every valid child slot is mixed and itself
+    /// deep, i.e. the whole subtree holds no uniform node down to L0.
     inline fn summarizeChildWord(child_state: u64, child_mixed: u64, valid: u32) SlotSummary {
         const vm = slotsValidMask(valid);
         const m = child_mixed & vm;
-        if (m != 0) return .{ .s = false, .m = true };
         const s = child_state & vm;
-        if (s == 0) return .{ .s = false, .m = false };
-        if (s == vm) return .{ .s = true, .m = false };
+        if (m == 0) {
+            if (s == 0) return .{ .s = false, .m = false };
+            if (s == vm) return .{ .s = true, .m = false };
+            return .{ .s = false, .m = true };
+        }
+        if (m == vm and s == vm) return .{ .s = true, .m = true };
         return .{ .s = false, .m = true };
     }
 
@@ -704,6 +715,72 @@ pub fn LayerBitsIterator(
             return (((@as(u64, 1) << w6) - 1) << l6);
         }
 
+        // Deep-mixed jump is only valid when the final output is raw bits.
+        // `iterateTargetBits` chains always use out 0 for uniform callbacks;
+        // coarse `out_layers` keep the old descent to preserve batching.
+        const deep_enabled: bool = (scan_layer >= 2) and (on_mixed != null) and (out_layers.active == 0) and (out_layers.inactive == 0);
+
+        // Direct leaf scan for one deep-mixed slot range.
+        // Covers `leaf_cnt` consecutive leaf words from `leaf_base`, clipped
+        // to the real leaf count; tail word masked by lastLeafMask.
+        // Uses the same single/dual polarity logic as BitsetIterator.
+        inline fn scanDeepLeafRange(ctx: Ctx, tree: *const BitTree, leaf_base: u64, leaf_cnt: u64) bool {
+            if (leaf_cnt == 0) return true;
+            if (tree.levels.items.len == 0) return true;
+            const leaves = tree.levels.items[0].state.items;
+            if (leaves.len == 0) return true;
+            const total: u32 = tree.total_bits;
+            if (total == 0) return true;
+            const total_words: u64 = (@as(u64, total) + 63) >> 6;
+            if (leaf_base >= total_words) return true;
+            var end: u64 = leaf_base + leaf_cnt;
+            if (end > total_words) end = total_words;
+            var lw_idx: u64 = leaf_base;
+            while (lw_idx < end) : (lw_idx += 1) {
+                const wi: usize = @intCast(lw_idx);
+                const lw: u64 = leaves[wi];
+                const allow: u64 = if (wi + 1 == leaves.len) lastLeafMask(total) else all_ones;
+                if (allow == 0) continue;
+                const base_bit: u64 = lw_idx * 64;
+                if (on_inactive == null) {
+                    var bits: u64 = lw & allow;
+                    while (bits != 0) {
+                        const b: u32 = @ctz(bits);
+                        bits &= bits - 1;
+                        if (on_active) |f| {
+                            if (!f(ctx, @intCast(base_bit + b))) return false;
+                        }
+                    }
+                } else if (on_active == null) {
+                    var bits: u64 = ~lw & allow;
+                    while (bits != 0) {
+                        const b: u32 = @ctz(bits);
+                        bits &= bits - 1;
+                        if (on_inactive) |f| {
+                            if (!f(ctx, @intCast(base_bit + b))) return false;
+                        }
+                    }
+                } else {
+                    var wanted: u64 = allow;
+                    while (wanted != 0) {
+                        const b: u32 = @ctz(wanted);
+                        wanted &= wanted - 1;
+                        const is_active = ((lw >> @as(u6, @intCast(b))) & 1) == 1;
+                        if (is_active) {
+                            if (on_active) |f| {
+                                if (!f(ctx, @intCast(base_bit + b))) return false;
+                            }
+                        } else {
+                            if (on_inactive) |f| {
+                                if (!f(ctx, @intCast(base_bit + b))) return false;
+                            }
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
         inline fn processWord(ctx: Ctx, tree: *const BitTree, st_items: []const u64, mx_items: []const u64, w: usize, allowed: u64, t_a: u64, t_i: u64, t_m: u64) bool {
             if (allowed == 0) return true;
             const st: u64 = st_items[w];
@@ -728,6 +805,43 @@ pub fn LayerBitsIterator(
                         const s: u32 = @ctz(rest);
                         rest &= rest - 1;
                         if (!emitOne(ctx, @as(u64, w) * 64 + s, out_layers.inactive, on_inactive, t_i)) return false;
+                    }
+                    return true;
+                }
+            }
+            if (comptime deep_enabled) {
+                const deep_all: u64 = st & mx & allowed;
+                if (deep_all != 0) {
+                    // Whole-word deep: one contiguous leaf range, no per-slot dispatch.
+                    if (deep_all == allowed) {
+                        const sh_word: u6 = @intCast(6 * scan_layer);
+                        const leaf_base: u64 = @as(u64, w) << sh_word;
+                        const leaf_cnt: u64 = @as(u64, 1) << sh_word;
+                        if (!scanDeepLeafRange(ctx, tree, leaf_base, leaf_cnt)) return false;
+                        return true;
+                    }
+                    // Partially deep word: keep ascending order, deep slots jump,
+                    // the rest use the normal mixed/uniform path.
+                    var rest: u64 = 0;
+                    if (on_active != null) rest |= a_all;
+                    if (on_inactive != null) rest |= allowed & ~m_all & ~a_all;
+                    rest |= m_all;
+                    const sh_slot: u6 = @intCast(6 * (scan_layer - 1));
+                    const slot_cnt: u64 = @as(u64, 1) << sh_slot;
+                    while (rest != 0) {
+                        const s: u32 = @ctz(rest);
+                        rest &= rest - 1;
+                        const bitm: u64 = @as(u64, 1) << @as(u6, @intCast(s));
+                        const id_scan: u64 = @as(u64, w) * 64 + s;
+                        if ((deep_all & bitm) != 0) {
+                            if (!scanDeepLeafRange(ctx, tree, id_scan << sh_slot, slot_cnt)) return false;
+                        } else if ((m_all & bitm) != 0) {
+                            if (!emitMixedOne(ctx, tree, id_scan, out_layers.mixed, on_mixed, t_m)) return false;
+                        } else if (on_active != null and (a_all & bitm) != 0) {
+                            if (!emitOne(ctx, id_scan, out_layers.active, on_active, t_a)) return false;
+                        } else if (on_inactive != null) {
+                            if (!emitOne(ctx, id_scan, out_layers.inactive, on_inactive, t_i)) return false;
+                        }
                     }
                     return true;
                 }
