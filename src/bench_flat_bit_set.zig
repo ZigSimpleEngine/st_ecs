@@ -148,8 +148,31 @@ fn benchThresholdPair(io: std.Io, alloc: Allocator, bits_total: u32, stride: u32
     try benchPair(io, alloc, name, &tree, &flat, .active, reps);
 }
 
-fn benchClusterPair(io: std.Io, alloc: Allocator, bits_total: u32, run: u32, gap: u32, reps: u32) !void {
-    var tree = BitTree.empty;
+/// Write path: fresh tree + per-bit `set` calls. Exercises propagate.
+/// Reports average fill time and per-set cost.
+fn benchFill(io: std.Io, alloc: Allocator, bits_total: u32, stride: u32, offset: u32, reps: u32) !void {
+    var watch = Stopwatch.start(io);
+    var r: u32 = 0;
+    var check: u64 = 0;
+    while (r < reps) : (r += 1) {
+        var tree = BitTree.empty;
+        try tree.resize(alloc, bits_total, .inactive);
+        var b: u32 = offset;
+        while (b < bits_total) : (b += stride) {
+            tree.set(b, .active);
+        }
+        check += tree.count(.active);
+        tree.deinit(alloc);
+    }
+    std.mem.doNotOptimizeAway(check);
+    const ns: f64 = @as(f64, @floatFromInt(watch.read())) / @as(f64, @floatFromInt(reps));
+    const per_set: f64 = ns / @as(f64, @floatFromInt(check / reps));
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "fill-s{d}-N{d}", .{ stride, bits_total });
+    std.debug.print("{s:<26} {d:>10} {d:>10.3} {s:>10} {d:>7.1}ns/set\n", .{ name, check / reps, ns / 1_000_000.0, "---", per_set });
+}
+
+fn benchClusterPair(io: std.Io, alloc: Allocator, bits_total: u32, run: u32, gap: u32, reps: u32) !void {    var tree = BitTree.empty;
     defer tree.deinit(alloc);
     var flat = FlatBitSet.empty;
     defer flat.deinit(alloc);
@@ -228,4 +251,7 @@ pub fn main(init: std.process.Init) !void {
     try benchClusterPair(io, alloc, 2_000_000, 1000, 10000, 20);
     try benchClusterPair(io, alloc, 500_000, 50, 50, 50);
     try benchClusterPair(io, alloc, 500_000, 50, 500, 50);
+
+    try benchFill(io, alloc, 1_000_000, 1, 0, 3);
+    try benchFill(io, alloc, 1_000_000, 997, 1, 5);
 }

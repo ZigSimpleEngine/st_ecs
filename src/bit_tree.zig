@@ -45,13 +45,15 @@ const max_levels: usize = 8;
 const all_ones: u64 = std.math.maxInt(u64);
 
 /// Counts leaf words needed to hold the given bit count.
+/// Divisor is a power of two: shift instead of division.
 inline fn leafWordsFor(bits: u32) usize {
-    return std.math.divCeil(u32, bits, leaf_fanout) catch unreachable;
+    return (@as(usize, bits) + leaf_fanout - 1) >> 6;
 }
 
 /// Counts parent summary words needed to cover the given child word count.
+/// Divisor is a power of two: shift instead of division.
 inline fn parentWordsFor(child_words: usize) usize {
-    return std.math.divCeil(usize, child_words, node_fanout) catch unreachable;
+    return (child_words + node_fanout - 1) >> 6;
 }
 
 /// Counts hierarchy levels needed for the given bit count.
@@ -78,18 +80,12 @@ fn wordsForLevel(level: usize, bits: u32) usize {
     return words;
 }
 
-/// Bits covered by one id at the given layer: 64^layer.
-inline fn spanBitsForLayer(layer: u32) u64 {
-    // layer < max_levels (<=7), shift <= 42, fits u64.
-    const s: u6 = @intCast(6 * layer);
-    return @as(u64, 1) << s;
-}
-
 /// Total ids at the given layer: ceil(total_bits / span).
+/// Span is always a power of two (64^layer): shift instead of division.
 inline fn totalIdsForLayer(total_bits: u32, layer: u32) u64 {
     if (total_bits == 0) return 0;
-    const span: u64 = spanBitsForLayer(layer);
-    return (@as(u64, total_bits) + span - 1) / span;
+    const sh: u6 = @intCast(6 * layer);
+    return (@as(u64, total_bits) + (@as(u64, 1) << sh) - 1) >> sh;
 }
 
 /// Valid-slot mask for 0..64 valid slots.
@@ -556,58 +552,58 @@ pub const BitTree = struct {
             },
             2 => {
                 const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 1, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.step);
+                const L1 = LayerBitsIterator(Ctx, 1, 1, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
                 return L1.runAll(ctx, self);
             },
             3 => {
                 const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.step);
-                const L2 = LayerBitsIterator(Ctx, 2, 2, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.step);
+                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
+                const L2 = LayerBitsIterator(Ctx, 2, 2, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
                 return L2.runAll(ctx, self);
             },
             4 => {
                 const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.step);
-                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.step);
-                const L3 = LayerBitsIterator(Ctx, 3, 3, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.step);
+                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
+                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
+                const L3 = LayerBitsIterator(Ctx, 3, 3, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.stepWord);
                 return L3.runAll(ctx, self);
             },
             5 => {
                 const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.step);
-                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.step);
-                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.step);
-                const L4 = LayerBitsIterator(Ctx, 4, 4, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.step);
+                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
+                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
+                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.stepWord);
+                const L4 = LayerBitsIterator(Ctx, 4, 4, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.stepWord);
                 return L4.runAll(ctx, self);
             },
             6 => {
                 const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.step);
-                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.step);
-                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.step);
-                const L4 = LayerBitsIterator(Ctx, 4, 5, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.step);
-                const L5 = LayerBitsIterator(Ctx, 5, 5, .{ .active = 0, .inactive = 0, .mixed = 5 }, on_active, on_inactive, L4.step);
+                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
+                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
+                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.stepWord);
+                const L4 = LayerBitsIterator(Ctx, 4, 5, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.stepWord);
+                const L5 = LayerBitsIterator(Ctx, 5, 5, .{ .active = 0, .inactive = 0, .mixed = 5 }, on_active, on_inactive, L4.stepWord);
                 return L5.runAll(ctx, self);
             },
             7 => {
                 const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.step);
-                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.step);
-                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.step);
-                const L4 = LayerBitsIterator(Ctx, 4, 5, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.step);
-                const L5 = LayerBitsIterator(Ctx, 5, 6, .{ .active = 0, .inactive = 0, .mixed = 5 }, on_active, on_inactive, L4.step);
-                const L6 = LayerBitsIterator(Ctx, 6, 6, .{ .active = 0, .inactive = 0, .mixed = 6 }, on_active, on_inactive, L5.step);
+                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
+                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
+                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.stepWord);
+                const L4 = LayerBitsIterator(Ctx, 4, 5, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.stepWord);
+                const L5 = LayerBitsIterator(Ctx, 5, 6, .{ .active = 0, .inactive = 0, .mixed = 5 }, on_active, on_inactive, L4.stepWord);
+                const L6 = LayerBitsIterator(Ctx, 6, 6, .{ .active = 0, .inactive = 0, .mixed = 6 }, on_active, on_inactive, L5.stepWord);
                 return L6.runAll(ctx, self);
             },
             8 => {
                 const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.step);
-                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.step);
-                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.step);
-                const L4 = LayerBitsIterator(Ctx, 4, 5, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.step);
-                const L5 = LayerBitsIterator(Ctx, 5, 6, .{ .active = 0, .inactive = 0, .mixed = 5 }, on_active, on_inactive, L4.step);
-                const L6 = LayerBitsIterator(Ctx, 6, 7, .{ .active = 0, .inactive = 0, .mixed = 6 }, on_active, on_inactive, L5.step);
-                const L7 = LayerBitsIterator(Ctx, 7, 7, .{ .active = 0, .inactive = 0, .mixed = 7 }, on_active, on_inactive, L6.step);
+                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
+                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
+                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.stepWord);
+                const L4 = LayerBitsIterator(Ctx, 4, 5, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.stepWord);
+                const L5 = LayerBitsIterator(Ctx, 5, 6, .{ .active = 0, .inactive = 0, .mixed = 5 }, on_active, on_inactive, L4.stepWord);
+                const L6 = LayerBitsIterator(Ctx, 6, 7, .{ .active = 0, .inactive = 0, .mixed = 6 }, on_active, on_inactive, L5.stepWord);
+                const L7 = LayerBitsIterator(Ctx, 7, 7, .{ .active = 0, .inactive = 0, .mixed = 7 }, on_active, on_inactive, L6.stepWord);
                 return L7.runAll(ctx, self);
             },
             else => unreachable,
@@ -708,12 +704,34 @@ pub fn LayerBitsIterator(
             return (((@as(u64, 1) << w6) - 1) << l6);
         }
 
-        inline fn processWord(ctx: Ctx, tree: *const BitTree, w: usize, allowed: u64, t_a: u64, t_i: u64, t_m: u64) bool {
+        inline fn processWord(ctx: Ctx, tree: *const BitTree, st_items: []const u64, mx_items: []const u64, w: usize, allowed: u64, t_a: u64, t_i: u64, t_m: u64) bool {
             if (allowed == 0) return true;
-            const st: u64 = tree.levels.items[scan_layer].state.items[w];
-            const mx: u64 = tree.levels.items[scan_layer].mixed.items[w];
+            const st: u64 = st_items[w];
+            const mx: u64 = mx_items[w];
             const m_all: u64 = mx & allowed;
             const a_all: u64 = st & ~mx & allowed;
+            // Fast paths for single-polarity scans without descent: every wanted
+            // slot shares one class, so per-slot classification is skipped.
+            if (on_mixed == null) {
+                if (on_inactive == null) {
+                    var rest: u64 = a_all;
+                    while (rest != 0) {
+                        const s: u32 = @ctz(rest);
+                        rest &= rest - 1;
+                        if (!emitOne(ctx, @as(u64, w) * 64 + s, out_layers.active, on_active, t_a)) return false;
+                    }
+                    return true;
+                }
+                if (on_active == null) {
+                    var rest: u64 = allowed & ~m_all & ~a_all;
+                    while (rest != 0) {
+                        const s: u32 = @ctz(rest);
+                        rest &= rest - 1;
+                        if (!emitOne(ctx, @as(u64, w) * 64 + s, out_layers.inactive, on_inactive, t_i)) return false;
+                    }
+                    return true;
+                }
+            }
             var rest: u64 = 0;
             if (on_mixed != null) rest |= m_all;
             if (on_active != null) rest |= a_all;
@@ -723,11 +741,11 @@ pub fn LayerBitsIterator(
                 rest &= rest - 1;
                 const bitm: u64 = @as(u64, 1) << @as(u6, @intCast(s));
                 const id_scan: u64 = @as(u64, w) * 64 + s;
-                if ((m_all & bitm) != 0) {
+                if (on_mixed != null and (m_all & bitm) != 0) {
                     if (!emitMixedOne(ctx, tree, id_scan, out_layers.mixed, on_mixed, t_m)) return false;
-                } else if ((a_all & bitm) != 0) {
+                } else if (on_active != null and (a_all & bitm) != 0) {
                     if (!emitOne(ctx, id_scan, out_layers.active, on_active, t_a)) return false;
-                } else {
+                } else if (on_inactive != null) {
                     if (!emitOne(ctx, id_scan, out_layers.inactive, on_inactive, t_i)) return false;
                 }
             }
@@ -751,7 +769,9 @@ pub fn LayerBitsIterator(
             const t_a: u64 = totalIdsForLayer(total, out_layers.active);
             const t_i: u64 = totalIdsForLayer(total, out_layers.inactive);
             const t_m: u64 = totalIdsForLayer(total, out_layers.mixed);
-            const words: usize = tree.levels.items[scan_layer].state.items.len;
+            const st_items: []const u64 = tree.levels.items[scan_layer].state.items;
+            const mx_items: []const u64 = tree.levels.items[scan_layer].mixed.items;
+            const words: usize = st_items.len;
             const w_first: usize = @intCast(base >> 6);
             const w_last: usize = @intCast((base + cnt - 1) >> 6);
             var w: usize = w_first;
@@ -766,9 +786,32 @@ pub fn LayerBitsIterator(
                 const trem: u64 = if (w_base >= total_scan) 0 else total_scan - w_base;
                 if (trem == 0) continue;
                 allowed &= slotsValidMask(@min(trem, @as(u64, 64)));
-                if (!processWord(ctx, tree, w, allowed, t_a, t_i, t_m)) return false;
+                if (!processWord(ctx, tree, st_items, mx_items, w, allowed, t_a, t_i, t_m)) return false;
             }
             return true;
+        }
+
+        /// Processes one word `w` at `scan_layer` directly (full word ∩ tail).
+        /// Fast path for chains: a parent mixed id at this scan granularity is
+        /// exactly a word index here, so no range expansion is needed.
+        /// Out-of-range words are skipped. Returns false on early callback stop.
+        pub fn stepWord(ctx: Ctx, tree: *const BitTree, w: u32) bool {
+            const total = tree.total_bits;
+            if (total == 0) return true;
+            if (scan_layer >= tree.levels.items.len) return true;
+            const st_items: []const u64 = tree.levels.items[scan_layer].state.items;
+            const mx_items: []const u64 = tree.levels.items[scan_layer].mixed.items;
+            const wi: usize = w;
+            if (wi >= st_items.len) return true;
+            const total_scan: u64 = totalIdsForLayer(total, scan_layer);
+            const base: u64 = @as(u64, wi) * 64;
+            if (base >= total_scan) return true;
+            const t_a: u64 = totalIdsForLayer(total, out_layers.active);
+            const t_i: u64 = totalIdsForLayer(total, out_layers.inactive);
+            const t_m: u64 = totalIdsForLayer(total, out_layers.mixed);
+            const trem: u64 = total_scan - base;
+            const allowed: u64 = slotsValidMask(@min(trem, @as(u64, 64)));
+            return processWord(ctx, tree, st_items, mx_items, wi, allowed, t_a, t_i, t_m);
         }
 
         /// Processes every word at `scan_layer` in ascending order.
@@ -781,13 +824,21 @@ pub fn LayerBitsIterator(
             const t_a: u64 = totalIdsForLayer(total, out_layers.active);
             const t_i: u64 = totalIdsForLayer(total, out_layers.inactive);
             const t_m: u64 = totalIdsForLayer(total, out_layers.mixed);
-            const words: usize = tree.levels.items[scan_layer].state.items.len;
+            const st_items: []const u64 = tree.levels.items[scan_layer].state.items;
+            const mx_items: []const u64 = tree.levels.items[scan_layer].mixed.items;
+            const words: usize = st_items.len;
+            // All words but the last are fully valid: no per-word mask math.
             var w: usize = 0;
-            while (w < words) : (w += 1) {
+            const full_words: usize = @intCast(total_scan >> 6);
+            const steady: usize = @min(full_words, words);
+            while (w < steady) : (w += 1) {
+                if (!processWord(ctx, tree, st_items, mx_items, w, all_ones, t_a, t_i, t_m)) return false;
+            }
+            if (w < words) {
                 const base: u64 = @as(u64, w) * 64;
-                if (base >= total_scan) break;
-                const remain: u64 = total_scan - base;
-                if (!processWord(ctx, tree, w, slotsValidMask(@min(remain, @as(u64, 64))), t_a, t_i, t_m)) return false;
+                if (base < total_scan) {
+                    if (!processWord(ctx, tree, st_items, mx_items, w, slotsValidMask(total_scan - base), t_a, t_i, t_m)) return false;
+                }
             }
             return true;
         }
@@ -808,10 +859,31 @@ pub fn BitsetIterator(
         inline fn processLeafWord(ctx: Ctx, leaves: []const u64, w: usize, allowed: u64) bool {
             if (allowed == 0) return true;
             const lw: u64 = leaves[w];
-            var wanted: u64 = 0;
-            if (on_active != null) wanted |= lw & allowed;
-            if (on_inactive != null) wanted |= ~lw & allowed;
             const base: u64 = @as(u64, w) * 64;
+            // Fast paths for single-polarity scans: no per-bit classification.
+            if (on_inactive == null) {
+                var bits: u64 = lw & allowed;
+                while (bits != 0) {
+                    const s: u32 = @ctz(bits);
+                    bits &= bits - 1;
+                    if (on_active) |f| {
+                        if (!f(ctx, @intCast(base + s))) return false;
+                    }
+                }
+                return true;
+            }
+            if (on_active == null) {
+                var bits: u64 = ~lw & allowed;
+                while (bits != 0) {
+                    const s: u32 = @ctz(bits);
+                    bits &= bits - 1;
+                    if (on_inactive) |f| {
+                        if (!f(ctx, @intCast(base + s))) return false;
+                    }
+                }
+                return true;
+            }
+            var wanted: u64 = (lw & allowed) | (~lw & allowed);
             while (wanted != 0) {
                 const s: u32 = @ctz(wanted);
                 wanted &= wanted - 1;
@@ -859,6 +931,20 @@ pub fn BitsetIterator(
                 if (!processLeafWord(ctx, leaves, w, allowed)) return false;
             }
             return true;
+        }
+
+        /// Processes one leaf word `w` directly (full word ∩ tail).
+        /// Fast path for chains: a parent mixed id is exactly a leaf word index.
+        /// Out-of-range words are skipped. Returns false on early callback stop.
+        pub fn stepWord(ctx: Ctx, tree: *const BitTree, w: u32) bool {
+            const total = tree.total_bits;
+            if (total == 0) return true;
+            if (tree.levels.items.len == 0) return true;
+            const leaves = tree.levels.items[0].state.items;
+            const wi: usize = w;
+            if (wi >= leaves.len) return true;
+            const allowed: u64 = if (wi + 1 == leaves.len) lastLeafMask(total) else all_ones;
+            return processLeafWord(ctx, leaves, wi, allowed);
         }
 
         /// Classifies every bit in ascending order. Returns false on early stop.
@@ -1232,6 +1318,87 @@ test "manual chain L2-L1-leaf exact bits" {
     var coll3 = IdCollector{ .buf = buf[0..] };
     try std.testing.expect(L2.step(&coll3, &tree, 9999));
     try std.testing.expectEqual(@as(usize, 0), coll3.n);
+}
+
+test "manual chain via stepWord exact bits" {
+    const alloc = std.testing.allocator;
+    var tree = BitTree.empty;
+    defer tree.deinit(alloc);
+    try tree.resize(alloc, 20000, .inactive);
+    tree.setRange(0, 5000, .active);
+    var buf: [5000]u32 = undefined;
+    var coll = IdCollector{ .buf = buf[0..] };
+    const Leaf = BitsetIterator(*IdCollector, 1, IdCollector.push, null);
+    const L1 = LayerBitsIterator(*IdCollector, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, IdCollector.push, null, Leaf.stepWord);
+    const L2 = LayerBitsIterator(*IdCollector, 2, 2, .{ .active = 0, .inactive = 0, .mixed = 2 }, IdCollector.push, null, L1.stepWord);
+    try std.testing.expect(L2.runAll(&coll, &tree));
+    try std.testing.expectEqual(@as(usize, 5000), coll.n);
+    var k: usize = 0;
+    while (k < coll.n) : (k += 1) {
+        try std.testing.expectEqual(@as(u32, @intCast(k)), coll.buf[k]);
+    }
+    // Direct stepWord: L1 word 1 holds ids [64, 128): 64..77 uniform active,
+    // 78 mixed ([4992, 5000) active of 64), 79..127 uniform inactive.
+    var w1 = IdCollector{ .buf = buf[0..] };
+    try std.testing.expect(L1.stepWord(&w1, &tree, 1));
+    try std.testing.expectEqual(@as(usize, 904), w1.n);
+    var j: usize = 0;
+    while (j < w1.n) : (j += 1) {
+        try std.testing.expectEqual(@as(u32, @intCast(4096 + j)), w1.buf[j]);
+    }
+    // L1 word 0 is fully uniform active: 64*64 bits.
+    var w0 = IdCollector{ .buf = buf[0..] };
+    try std.testing.expect(L1.stepWord(&w0, &tree, 0));
+    try std.testing.expectEqual(@as(usize, 4096), w0.n);
+    // OOB word is a silent no-op.
+    var wbad = IdCollector{ .buf = buf[0..] };
+    try std.testing.expect(L1.stepWord(&wbad, &tree, 9999));
+    try std.testing.expectEqual(@as(usize, 0), wbad.n);
+    // Leaf tail word 312 ([19968, 20000)) is uniform inactive: nothing.
+    var leaf_tail = IdCollector{ .buf = buf[0..] };
+    try std.testing.expect(Leaf.stepWord(&leaf_tail, &tree, 312));
+    try std.testing.expectEqual(@as(usize, 0), leaf_tail.n);
+    // Leaf word 78 ([4992, 5056)) contributes its 8 active bits.
+    var leaf78 = IdCollector{ .buf = buf[0..] };
+    try std.testing.expect(Leaf.stepWord(&leaf78, &tree, 78));
+    try std.testing.expectEqual(@as(usize, 8), leaf78.n);
+    var q: usize = 0;
+    while (q < leaf78.n) : (q += 1) {
+        try std.testing.expectEqual(@as(u32, @intCast(4992 + q)), leaf78.buf[q]);
+    }
+}
+
+test "leaf iterator both polarities exact" {
+    const alloc = std.testing.allocator;
+    var tree = BitTree.empty;
+    defer tree.deinit(alloc);
+    try tree.resize(alloc, 200, .inactive);
+    tree.setBit(3, true);
+    tree.setBit(5, true);
+    tree.setBit(64, true);
+    var a_buf: [8]u32 = undefined;
+    var i_buf: [200]u32 = undefined;
+    var t = TriCollector{ .a_buf = a_buf[0..], .i_buf = i_buf[0..], .m_buf = &[_]u32{} };
+    const Leaf = BitsetIterator(*TriCollector, 0, TriCollector.pushA, TriCollector.pushI);
+    try std.testing.expect(Leaf.runAll(&t, &tree));
+    try std.testing.expectEqual(@as(usize, 3), t.na);
+    try std.testing.expectEqual(@as(usize, 197), t.ni);
+    try std.testing.expectEqual(@as(u32, 3), t.a_buf[0]);
+    try std.testing.expectEqual(@as(u32, 5), t.a_buf[1]);
+    try std.testing.expectEqual(@as(u32, 64), t.a_buf[2]);
+    // Ascending and disjoint.
+    var k: usize = 1;
+    while (k < t.na) : (k += 1) try std.testing.expect(t.a_buf[k - 1] < t.a_buf[k]);
+    k = 1;
+    while (k < t.ni) : (k += 1) try std.testing.expect(t.i_buf[k - 1] < t.i_buf[k]);
+    try std.testing.expectEqual(@as(u32, 0), t.i_buf[0]);
+    // Restricted single-bit step classifies one bit.
+    var t2 = TriCollector{ .a_buf = a_buf[0..], .i_buf = i_buf[0..], .m_buf = &[_]u32{} };
+    try std.testing.expect(Leaf.step(&t2, &tree, 5));
+    try std.testing.expectEqual(@as(usize, 1), t2.na);
+    try std.testing.expectEqual(@as(usize, 0), t2.ni);
+    try std.testing.expect(Leaf.step(&t2, &tree, 6));
+    try std.testing.expectEqual(@as(usize, 1), t2.ni);
 }
 
 test "OutLayers split granularities" {
