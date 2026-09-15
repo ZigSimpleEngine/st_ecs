@@ -85,7 +85,7 @@ fn wordsForLevel(level: usize, bits: u32) usize {
 /// Total ids at the given layer: ceil(total_bits / span).
 /// Span is always a power of two (64^layer): shift instead of division.
 inline fn totalIdsForLayer(total_bits: u32, layer: u32) u64 {
-    // Every caller proves total_bits != 0 first (step/stepWord/runAll early-return,
+    // Every caller proves total_bits != 0 first (stepSlice/runAll early-return,
     // non-empty levels imply total > 0): the branch was never taken on hot paths,
     // so it is a Debug-only contract now and free in release.
     std.debug.assert(total_bits != 0);
@@ -122,13 +122,37 @@ fn rangeMask(word_idx: usize, range_start: u32, range_end: u64) u64 {
     return ((@as(u64, 1) << w_s) - 1) << lo_s;
 }
 
-/// Per-polarity output granularity for LayerBitsIterator.
-/// Each field is independent: uniform callbacks may emit raw bit ids (0)
-/// while mixed descends at coarser granularity, or all three may be equal.
-pub const OutLayers = struct {
-    active: u32,
-    inactive: u32,
-    mixed: u32,
+/// Slice of consecutive ids in one hierarchy layer: [start, end).
+/// Polarity is known statically from which callback fired:
+/// on_active = uniform active (1,0), on_inactive = uniform inactive (0,0),
+/// on_mixed = shallow mixed (0,1), on_deep_mixed = deep mixed (1,1).
+/// No state/mixed bits are carried: the receiver knows them from the callback.
+/// The iterator always emits in its own scan layer; the receiver converts the
+/// range to whatever layer it needs via `bitBase` / `bitLen`.
+pub const BitsSlice = struct {
+    /// Inclusive start id in units of `layer`.
+    start: u32,
+    /// Exclusive end id in units of `layer`.
+    end: u32,
+    /// Hierarchy layer of the ids (0 = raw bits). Plain u8 for cheap shifts.
+    layer: u8,
+
+    /// Number of covered ids in slice units.
+    pub inline fn len(self: BitsSlice) u64 {
+        return @as(u64, self.end) - self.start;
+    }
+
+    /// First covered raw bit id.
+    pub inline fn bitBase(self: BitsSlice) u64 {
+        std.debug.assert(self.layer < max_levels);
+        return @as(u64, self.start) << @as(u6, @intCast(@as(u32, self.layer) * 6));
+    }
+
+    /// Count of covered raw bits.
+    pub inline fn bitLen(self: BitsSlice) u64 {
+        std.debug.assert(self.layer < max_levels);
+        return self.len() << @as(u6, @intCast(@as(u32, self.layer) * 6));
+    }
 };
 
 /// Bitset with a dual-mask hierarchy, scanned one layer at a time.
@@ -616,9 +640,11 @@ pub const BitTree = struct {
         }
     }
 
-    /// Full per-bit descent from root to leaves through a comptime stage chain.
-    /// Output is ascending bit order: every stage scans slots ascending and mixed
-    /// regions are descended synchronously (depth-first), so callbacks fire in order.
+    /// Per-bit descent built on slices (fair adapter + test oracle).
+    /// Same ascending, depth-first semantics as the old stage chain: uniform
+    /// slices are expanded to per-bit callbacks, mixed/deep slices descend
+    /// via `stepSlice`. Deep slices route to the mixed link (external code
+    /// that wants the deep shortcut uses `LayerSlicesIterator` directly).
     /// Returns false when a callback stopped the walk early, true otherwise.
     /// No allocation, no output arrays: results stream straight into callbacks.
     pub fn iterateTargetBits(
@@ -629,157 +655,408 @@ pub const BitTree = struct {
         comptime on_inactive: ?fn (Ctx, u32) bool,
     ) bool {
         if (on_active == null and on_inactive == null) return true;
+        const C = TargetChain(Ctx, on_active, on_inactive);
+        const c = C{ .user = ctx };
+        // Deep slices bypass intermediate levels via the external leaf jump.
+        // Shallow slices keep stepping down: their subtrees may hold uniform
+        // nodes that expand cheaper one level at a time.
+        const deepCb = if (on_active != null and on_inactive != null) C.deepBoth else if (on_active != null) C.deepActive else C.deepInactive;
         const depth: usize = self.levels.items.len;
         switch (depth) {
             0 => return true,
             1 => {
-                const Leaf = BitsetIterator(Ctx, 0, on_active, on_inactive);
-                return Leaf.runAll(ctx, self);
+                const L0 = LayerSlicesIterator(C, 0, C.active, C.inactive, null, null);
+                return L0.runAll(c, self);
             },
             2 => {
-                const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 1, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
-                return L1.runAll(ctx, self);
+                const L0 = LayerSlicesIterator(C, 0, C.active, C.inactive, null, null);
+                const L1 = LayerSlicesIterator(C, 1, C.active, C.inactive, L0.stepSlice, deepCb);
+                return L1.runAll(c, self);
             },
             3 => {
-                const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
-                const L2 = LayerBitsIterator(Ctx, 2, 2, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
-                return L2.runAll(ctx, self);
+                const L0 = LayerSlicesIterator(C, 0, C.active, C.inactive, null, null);
+                const L1 = LayerSlicesIterator(C, 1, C.active, C.inactive, L0.stepSlice, deepCb);
+                const L2 = LayerSlicesIterator(C, 2, C.active, C.inactive, L1.stepSlice, deepCb);
+                return L2.runAll(c, self);
             },
             4 => {
-                const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
-                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
-                const L3 = LayerBitsIterator(Ctx, 3, 3, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.stepWord);
-                return L3.runAll(ctx, self);
+                const L0 = LayerSlicesIterator(C, 0, C.active, C.inactive, null, null);
+                const L1 = LayerSlicesIterator(C, 1, C.active, C.inactive, L0.stepSlice, deepCb);
+                const L2 = LayerSlicesIterator(C, 2, C.active, C.inactive, L1.stepSlice, deepCb);
+                const L3 = LayerSlicesIterator(C, 3, C.active, C.inactive, L2.stepSlice, deepCb);
+                return L3.runAll(c, self);
             },
             5 => {
-                const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
-                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
-                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.stepWord);
-                const L4 = LayerBitsIterator(Ctx, 4, 4, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.stepWord);
-                return L4.runAll(ctx, self);
+                const L0 = LayerSlicesIterator(C, 0, C.active, C.inactive, null, null);
+                const L1 = LayerSlicesIterator(C, 1, C.active, C.inactive, L0.stepSlice, deepCb);
+                const L2 = LayerSlicesIterator(C, 2, C.active, C.inactive, L1.stepSlice, deepCb);
+                const L3 = LayerSlicesIterator(C, 3, C.active, C.inactive, L2.stepSlice, deepCb);
+                const L4 = LayerSlicesIterator(C, 4, C.active, C.inactive, L3.stepSlice, deepCb);
+                return L4.runAll(c, self);
             },
             6 => {
-                const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
-                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
-                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.stepWord);
-                const L4 = LayerBitsIterator(Ctx, 4, 5, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.stepWord);
-                const L5 = LayerBitsIterator(Ctx, 5, 5, .{ .active = 0, .inactive = 0, .mixed = 5 }, on_active, on_inactive, L4.stepWord);
-                return L5.runAll(ctx, self);
+                const L0 = LayerSlicesIterator(C, 0, C.active, C.inactive, null, null);
+                const L1 = LayerSlicesIterator(C, 1, C.active, C.inactive, L0.stepSlice, deepCb);
+                const L2 = LayerSlicesIterator(C, 2, C.active, C.inactive, L1.stepSlice, deepCb);
+                const L3 = LayerSlicesIterator(C, 3, C.active, C.inactive, L2.stepSlice, deepCb);
+                const L4 = LayerSlicesIterator(C, 4, C.active, C.inactive, L3.stepSlice, deepCb);
+                const L5 = LayerSlicesIterator(C, 5, C.active, C.inactive, L4.stepSlice, deepCb);
+                return L5.runAll(c, self);
             },
             7 => {
-                const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
-                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
-                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.stepWord);
-                const L4 = LayerBitsIterator(Ctx, 4, 5, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.stepWord);
-                const L5 = LayerBitsIterator(Ctx, 5, 6, .{ .active = 0, .inactive = 0, .mixed = 5 }, on_active, on_inactive, L4.stepWord);
-                const L6 = LayerBitsIterator(Ctx, 6, 6, .{ .active = 0, .inactive = 0, .mixed = 6 }, on_active, on_inactive, L5.stepWord);
-                return L6.runAll(ctx, self);
+                const L0 = LayerSlicesIterator(C, 0, C.active, C.inactive, null, null);
+                const L1 = LayerSlicesIterator(C, 1, C.active, C.inactive, L0.stepSlice, deepCb);
+                const L2 = LayerSlicesIterator(C, 2, C.active, C.inactive, L1.stepSlice, deepCb);
+                const L3 = LayerSlicesIterator(C, 3, C.active, C.inactive, L2.stepSlice, deepCb);
+                const L4 = LayerSlicesIterator(C, 4, C.active, C.inactive, L3.stepSlice, deepCb);
+                const L5 = LayerSlicesIterator(C, 5, C.active, C.inactive, L4.stepSlice, deepCb);
+                const L6 = LayerSlicesIterator(C, 6, C.active, C.inactive, L5.stepSlice, deepCb);
+                return L6.runAll(c, self);
             },
             8 => {
-                const Leaf = BitsetIterator(Ctx, 1, on_active, on_inactive);
-                const L1 = LayerBitsIterator(Ctx, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, on_active, on_inactive, Leaf.stepWord);
-                const L2 = LayerBitsIterator(Ctx, 2, 3, .{ .active = 0, .inactive = 0, .mixed = 2 }, on_active, on_inactive, L1.stepWord);
-                const L3 = LayerBitsIterator(Ctx, 3, 4, .{ .active = 0, .inactive = 0, .mixed = 3 }, on_active, on_inactive, L2.stepWord);
-                const L4 = LayerBitsIterator(Ctx, 4, 5, .{ .active = 0, .inactive = 0, .mixed = 4 }, on_active, on_inactive, L3.stepWord);
-                const L5 = LayerBitsIterator(Ctx, 5, 6, .{ .active = 0, .inactive = 0, .mixed = 5 }, on_active, on_inactive, L4.stepWord);
-                const L6 = LayerBitsIterator(Ctx, 6, 7, .{ .active = 0, .inactive = 0, .mixed = 6 }, on_active, on_inactive, L5.stepWord);
-                const L7 = LayerBitsIterator(Ctx, 7, 7, .{ .active = 0, .inactive = 0, .mixed = 7 }, on_active, on_inactive, L6.stepWord);
-                return L7.runAll(ctx, self);
+                const L0 = LayerSlicesIterator(C, 0, C.active, C.inactive, null, null);
+                const L1 = LayerSlicesIterator(C, 1, C.active, C.inactive, L0.stepSlice, deepCb);
+                const L2 = LayerSlicesIterator(C, 2, C.active, C.inactive, L1.stepSlice, deepCb);
+                const L3 = LayerSlicesIterator(C, 3, C.active, C.inactive, L2.stepSlice, deepCb);
+                const L4 = LayerSlicesIterator(C, 4, C.active, C.inactive, L3.stepSlice, deepCb);
+                const L5 = LayerSlicesIterator(C, 5, C.active, C.inactive, L4.stepSlice, deepCb);
+                const L6 = LayerSlicesIterator(C, 6, C.active, C.inactive, L5.stepSlice, deepCb);
+                const L7 = LayerSlicesIterator(C, 7, C.active, C.inactive, L6.stepSlice, deepCb);
+                return L7.runAll(c, self);
             },
             else => unreachable,
         }
     }
+
+    /// O(slices) arithmetic sum of active bit ids: no per-bit loop.
+    /// Uniform active slices contribute n*(first+last)/2 each; mixed slices
+    /// descend via `stepSlice`. Demonstrates the slice ceiling for dense data.
+    pub fn sumActiveIds(self: *const Self) struct { sum: u64, count: u64 } {
+        var st = ArithState{};
+        const c = ArithChain{ .st = &st };
+        const depth: usize = self.levels.items.len;
+        switch (depth) {
+            0 => {},
+            1 => {
+                const L0 = LayerSlicesIterator(ArithChain, 0, ArithChain.active, null, null, null);
+                _ = L0.runAll(c, self);
+            },
+            2 => {
+                const L0 = LayerSlicesIterator(ArithChain, 0, ArithChain.active, null, null, null);
+                const L1 = LayerSlicesIterator(ArithChain, 1, ArithChain.active, null, L0.stepSlice, ArithChain.deep);
+                _ = L1.runAll(c, self);
+            },
+            3 => {
+                const L0 = LayerSlicesIterator(ArithChain, 0, ArithChain.active, null, null, null);
+                const L1 = LayerSlicesIterator(ArithChain, 1, ArithChain.active, null, L0.stepSlice, ArithChain.deep);
+                const L2 = LayerSlicesIterator(ArithChain, 2, ArithChain.active, null, L1.stepSlice, ArithChain.deep);
+                _ = L2.runAll(c, self);
+            },
+            4 => {
+                const L0 = LayerSlicesIterator(ArithChain, 0, ArithChain.active, null, null, null);
+                const L1 = LayerSlicesIterator(ArithChain, 1, ArithChain.active, null, L0.stepSlice, ArithChain.deep);
+                const L2 = LayerSlicesIterator(ArithChain, 2, ArithChain.active, null, L1.stepSlice, ArithChain.deep);
+                const L3 = LayerSlicesIterator(ArithChain, 3, ArithChain.active, null, L2.stepSlice, ArithChain.deep);
+                _ = L3.runAll(c, self);
+            },
+            5 => {
+                const L0 = LayerSlicesIterator(ArithChain, 0, ArithChain.active, null, null, null);
+                const L1 = LayerSlicesIterator(ArithChain, 1, ArithChain.active, null, L0.stepSlice, ArithChain.deep);
+                const L2 = LayerSlicesIterator(ArithChain, 2, ArithChain.active, null, L1.stepSlice, ArithChain.deep);
+                const L3 = LayerSlicesIterator(ArithChain, 3, ArithChain.active, null, L2.stepSlice, ArithChain.deep);
+                const L4 = LayerSlicesIterator(ArithChain, 4, ArithChain.active, null, L3.stepSlice, ArithChain.deep);
+                _ = L4.runAll(c, self);
+            },
+            6 => {
+                const L0 = LayerSlicesIterator(ArithChain, 0, ArithChain.active, null, null, null);
+                const L1 = LayerSlicesIterator(ArithChain, 1, ArithChain.active, null, L0.stepSlice, ArithChain.deep);
+                const L2 = LayerSlicesIterator(ArithChain, 2, ArithChain.active, null, L1.stepSlice, ArithChain.deep);
+                const L3 = LayerSlicesIterator(ArithChain, 3, ArithChain.active, null, L2.stepSlice, ArithChain.deep);
+                const L4 = LayerSlicesIterator(ArithChain, 4, ArithChain.active, null, L3.stepSlice, ArithChain.deep);
+                const L5 = LayerSlicesIterator(ArithChain, 5, ArithChain.active, null, L4.stepSlice, ArithChain.deep);
+                _ = L5.runAll(c, self);
+            },
+            7 => {
+                const L0 = LayerSlicesIterator(ArithChain, 0, ArithChain.active, null, null, null);
+                const L1 = LayerSlicesIterator(ArithChain, 1, ArithChain.active, null, L0.stepSlice, ArithChain.deep);
+                const L2 = LayerSlicesIterator(ArithChain, 2, ArithChain.active, null, L1.stepSlice, ArithChain.deep);
+                const L3 = LayerSlicesIterator(ArithChain, 3, ArithChain.active, null, L2.stepSlice, ArithChain.deep);
+                const L4 = LayerSlicesIterator(ArithChain, 4, ArithChain.active, null, L3.stepSlice, ArithChain.deep);
+                const L5 = LayerSlicesIterator(ArithChain, 5, ArithChain.active, null, L4.stepSlice, ArithChain.deep);
+                const L6 = LayerSlicesIterator(ArithChain, 6, ArithChain.active, null, L5.stepSlice, ArithChain.deep);
+                _ = L6.runAll(c, self);
+            },
+            8 => {
+                const L0 = LayerSlicesIterator(ArithChain, 0, ArithChain.active, null, null, null);
+                const L1 = LayerSlicesIterator(ArithChain, 1, ArithChain.active, null, L0.stepSlice, ArithChain.deep);
+                const L2 = LayerSlicesIterator(ArithChain, 2, ArithChain.active, null, L1.stepSlice, ArithChain.deep);
+                const L3 = LayerSlicesIterator(ArithChain, 3, ArithChain.active, null, L2.stepSlice, ArithChain.deep);
+                const L4 = LayerSlicesIterator(ArithChain, 4, ArithChain.active, null, L3.stepSlice, ArithChain.deep);
+                const L5 = LayerSlicesIterator(ArithChain, 5, ArithChain.active, null, L4.stepSlice, ArithChain.deep);
+                const L6 = LayerSlicesIterator(ArithChain, 6, ArithChain.active, null, L5.stepSlice, ArithChain.deep);
+                const L7 = LayerSlicesIterator(ArithChain, 7, ArithChain.active, null, L6.stepSlice, ArithChain.deep);
+                _ = L7.runAll(c, self);
+            },
+            else => unreachable,
+        }
+        return .{ .sum = st.sum, .count = st.count };
+    }
 };
 
-/// Callback-based single-layer iterator factory.
-/// Callbacks take (Ctx, u32) [mixed: (Ctx, *const BitTree, u32)] and return
-/// bool (false stops the walk).
-///
-/// Scans words at `scan_layer`. `step(id)` treats `id` as one entry in
-/// `in_layer` format (requires `in_layer >= scan_layer`) and processes the
-/// covered `scan_layer` range; `runAll()` scans the whole layer.
-/// Each non-null callback fires per matching id converted to its own
-/// `out_layers` granularity (each requires `out <= scan_layer`).
-/// Slots are visited in ascending order and mixed regions are descended
-/// synchronously, so callbacks fire in ascending id order (depth-first).
-/// Null callbacks prune both the call and the mask computation at comptime.
-/// Returns false on the first callback that returns false, true otherwise.
-/// Never allocates.
-pub fn LayerBitsIterator(
-    comptime Ctx: type,
-    comptime scan_layer: u32,
-    comptime in_layer: u32,
-    comptime out_layers: OutLayers,
-    comptime on_active: ?fn (Ctx, u32) bool,
-    comptime on_inactive: ?fn (Ctx, u32) bool,
-    comptime on_mixed: ?fn (Ctx, *const BitTree, u32) bool,
-) type {
-    if (in_layer < scan_layer) @compileError("in_layer must be >= scan_layer");
-    if (on_active != null and out_layers.active > scan_layer) @compileError("out active must be <= scan_layer");
-    if (on_inactive != null and out_layers.inactive > scan_layer) @compileError("out inactive must be <= scan_layer");
-    if (on_mixed != null and out_layers.mixed > scan_layer) @compileError("out mixed must be <= scan_layer");
-    if (on_active == null and on_inactive == null and on_mixed == null) @compileError("at least one callback required");
+/// Leaf word range covered by a slice at layer >= 1, clipped to the tree.
+/// Shared by the external deep-jump callbacks (fair adapter + arith ceiling).
+inline fn deepLeafRange(tree: *const BitTree, s: BitsSlice) struct { leaves: []const u64, base: u64, end: u64, words: u64, tail: u64 } {
+    const leaves = tree.levels.items[0].state.items;
+    const total = tree.total_bits;
+    std.debug.assert(s.layer < max_levels);
+    std.debug.assert(s.layer >= 1);
+    // One layer-L id spans 64^(L-1) leaf words (L0 ids are bits, not words).
+    const sh: u6 = @intCast(@as(u32, s.layer - 1) * 6);
+    const lb: u64 = @as(u64, s.start) << sh;
+    const lc: u64 = (@as(u64, s.end) - @as(u64, s.start)) << sh;
+    const words: u64 = (@as(u64, total) + 63) >> 6;
+    var le: u64 = lb + lc;
+    if (le > words) le = words;
+    if (le > leaves.len) le = leaves.len;
+    return .{ .leaves = leaves, .base = @min(lb, le), .end = le, .words = words, .tail = lastLeafMask(total) };
+}
+
+/// Per-bit expansion chain context for `BitTree.iterateTargetBits`.
+/// Uniform slices are expanded to ascending bit ids with tail clipping.
+fn TargetChain(comptime Ctx: type, comptime on_a: ?fn (Ctx, u32) bool, comptime on_i: ?fn (Ctx, u32) bool) type {
     return struct {
-        inline fn emitOne(ctx: Ctx, id_scan: u64, comptime out_l: u32, comptime cb: ?fn (Ctx, u32) bool, total_out: u64) bool {
-            const f = cb orelse return true;
-            const d: u32 = comptime (scan_layer - out_l);
-            if (comptime d == 0) {
-                if (id_scan >= total_out) return true;
-                return f(ctx, @intCast(id_scan));
-            }
-            const sh: u6 = comptime @intCast(6 * d);
-            const cnt: u64 = comptime (@as(u64, 1) << sh);
-            const base: u64 = id_scan << sh;
-            // Fast path: fully covered range needs no per-element bounds check,
-            // which keeps the loop vectorizable.
-            if (base + cnt <= total_out) {
-                var k: u64 = 0;
-                while (k < cnt) : (k += 1) {
-                    if (!f(ctx, @intCast(base + k))) return false;
+        const Self = @This();
+        user: Ctx,
+
+        pub fn active(c: Self, tree: *const BitTree, s: BitsSlice) bool {
+            const f = on_a orelse return true;
+            return expand(tree.total_bits, c.user, f, s);
+        }
+
+        pub fn inactive(c: Self, tree: *const BitTree, s: BitsSlice) bool {
+            const f = on_i orelse return true;
+            return expand(tree.total_bits, c.user, f, s);
+        }
+
+        /// External deep jump, active polarity: scans leaves directly with
+        /// ctz, no intermediate levels are visited. Order is preserved: the
+        /// slice range is exact, siblings come before/after untouched.
+        pub fn deepActive(c: Self, tree: *const BitTree, s: BitsSlice) bool {
+            const f = on_a orelse return true;
+            if (tree.levels.items.len == 0) return true;
+            if (s.layer == 0) return expand(tree.total_bits, c.user, f, s);
+            const r = deepLeafRange(tree, s);
+            if (r.base >= r.end) return true;
+            var w: u64 = r.base;
+            while (w < r.end) : (w += 1) {
+                const lw: u64 = r.leaves[@intCast(w)];
+                const allow: u64 = if (w + 1 == r.words) r.tail else all_ones;
+                var bits: u64 = lw & allow;
+                while (bits != 0) {
+                    const b: u32 = @ctz(bits);
+                    bits &= bits - 1;
+                    if (!f(c.user, @intCast(w * 64 + b))) return false;
                 }
-                return true;
-            }
-            if (base >= total_out) return true;
-            var k: u64 = 0;
-            while (k < cnt) : (k += 1) {
-                const oid: u64 = base + k;
-                if (oid >= total_out) break;
-                if (!f(ctx, @intCast(oid))) return false;
             }
             return true;
         }
 
-        inline fn emitMixedOne(ctx: Ctx, tree: *const BitTree, id_scan: u64, comptime out_l: u32, comptime cb: ?fn (Ctx, *const BitTree, u32) bool, total_out: u64) bool {
-            const f = cb orelse return true;
-            const d: u32 = comptime (scan_layer - out_l);
-            if (comptime d == 0) {
-                if (id_scan >= total_out) return true;
-                return f(ctx, tree, @intCast(id_scan));
+        /// External deep jump, inactive polarity.
+        pub fn deepInactive(c: Self, tree: *const BitTree, s: BitsSlice) bool {
+            const f = on_i orelse return true;
+            if (tree.levels.items.len == 0) return true;
+            if (s.layer == 0) return expand(tree.total_bits, c.user, f, s);
+            const r = deepLeafRange(tree, s);
+            if (r.base >= r.end) return true;
+            var w: u64 = r.base;
+            while (w < r.end) : (w += 1) {
+                const lw: u64 = r.leaves[@intCast(w)];
+                const allow: u64 = if (w + 1 == r.words) r.tail else all_ones;
+                var bits: u64 = ~lw & allow;
+                while (bits != 0) {
+                    const b: u32 = @ctz(bits);
+                    bits &= bits - 1;
+                    if (!f(c.user, @intCast(w * 64 + b))) return false;
+                }
             }
-            const sh: u6 = comptime @intCast(6 * d);
-            const cnt: u64 = comptime (@as(u64, 1) << sh);
-            const base: u64 = id_scan << sh;
-            if (base + cnt <= total_out) {
-                var k: u64 = 0;
-                while (k < cnt) : (k += 1) {
-                    if (!f(ctx, tree, @intCast(base + k))) return false;
+            return true;
+        }
+
+        /// External deep jump, both polarities: per-bit classification in order.
+        pub fn deepBoth(c: Self, tree: *const BitTree, s: BitsSlice) bool {
+            if (on_a == null) return c.deepInactive(tree, s);
+            if (on_i == null) return c.deepActive(tree, s);
+            if (tree.levels.items.len == 0) return true;
+            if (s.layer == 0) {
+                // Unreachable in practice (L0 has no mixed words): ascending classify.
+                const fa0 = on_a.?;
+                const fi0 = on_i.?;
+                var k: u64 = s.start;
+                while (k < s.end) : (k += 1) {
+                    const id: u32 = @intCast(k);
+                    if (tree.getBit(id)) {
+                        if (!fa0(c.user, id)) return false;
+                    } else {
+                        if (!fi0(c.user, id)) return false;
+                    }
                 }
                 return true;
             }
-            if (base >= total_out) return true;
-            var k: u64 = 0;
-            while (k < cnt) : (k += 1) {
-                const oid: u64 = base + k;
-                if (oid >= total_out) break;
-                if (!f(ctx, tree, @intCast(oid))) return false;
+            const fa = on_a.?;
+            const fi = on_i.?;
+            const r = deepLeafRange(tree, s);
+            if (r.base >= r.end) return true;
+            var w: u64 = r.base;
+            while (w < r.end) : (w += 1) {
+                const lw: u64 = r.leaves[@intCast(w)];
+                const allow: u64 = if (w + 1 == r.words) r.tail else all_ones;
+                var wanted: u64 = allow;
+                while (wanted != 0) {
+                    const b: u32 = @ctz(wanted);
+                    wanted &= wanted - 1;
+                    const is_a = ((lw >> @as(u6, @intCast(b))) & 1) == 1;
+                    if (is_a) {
+                        if (!fa(c.user, @intCast(w * 64 + b))) return false;
+                    } else {
+                        if (!fi(c.user, @intCast(w * 64 + b))) return false;
+                    }
+                }
             }
             return true;
+        }
+
+        inline fn expand(total: u32, user: Ctx, f: fn (Ctx, u32) bool, s: BitsSlice) bool {
+            std.debug.assert(s.layer < max_levels);
+            const sh: u6 = @intCast(@as(u32, s.layer) * 6);
+            const base: u64 = @as(u64, s.start) << sh;
+            var cnt: u64 = (@as(u64, s.end) - @as(u64, s.start)) << sh;
+            const t: u64 = total;
+            if (base >= t) return true;
+            if (base + cnt > t) cnt = t - base;
+            var k: u64 = 0;
+            while (k < cnt) : (k += 1) {
+                if (!f(user, @intCast(base + k))) return false;
+            }
+            return true;
+        }
+    };
+}
+
+/// Arithmetic chain context for `BitTree.sumActiveIds`: O(1) per slice.
+/// n*(first+last)/2 is computed in u128 (intermediate exceeds u64 for big N)
+/// then narrowed: the final sum of 0..2^32-1 still fits u64.
+const ArithState = struct {
+    sum: u64 = 0,
+    count: u64 = 0,
+};
+
+const ArithChain = struct {
+    st: *ArithState,
+
+    pub fn active(c: ArithChain, tree: *const BitTree, s: BitsSlice) bool {
+        std.debug.assert(s.layer < max_levels);
+        const sh: u6 = @intCast(@as(u32, s.layer) * 6);
+        const base: u64 = @as(u64, s.start) << sh;
+        var cnt: u64 = (@as(u64, s.end) - @as(u64, s.start)) << sh;
+        const t: u64 = tree.total_bits;
+        if (base >= t) return true;
+        if (base + cnt > t) cnt = t - base;
+        if (cnt == 0) return true;
+        // Tiny slices are cheaper as plain adds than a u128 division.
+        if (cnt <= 16) {
+            var k: u64 = 0;
+            while (k < cnt) : (k += 1) {
+                c.st.sum += base + k;
+                c.st.count += 1;
+            }
+            return true;
+        }
+        const n: u128 = cnt;
+        const first: u128 = base;
+        const last: u128 = base + cnt - 1;
+        c.st.sum += @intCast(n * (first + last) / 2);
+        c.st.count += cnt;
+        return true;
+    }
+
+    /// External deep jump for the arith ceiling: ctz accumulation straight
+    /// from the leaves, no intermediate levels, no u128 division.
+    pub fn deep(c: ArithChain, tree: *const BitTree, s: BitsSlice) bool {
+        if (tree.levels.items.len == 0) return true;
+        if (s.layer == 0) return c.active(tree, s);
+        const r = deepLeafRange(tree, s);
+        if (r.base >= r.end) return true;
+        var w: u64 = r.base;
+        while (w < r.end) : (w += 1) {
+            const lw: u64 = r.leaves[@intCast(w)];
+            const allow: u64 = if (w + 1 == r.words) r.tail else all_ones;
+            var bits: u64 = lw & allow;
+            while (bits != 0) {
+                const b: u32 = @ctz(bits);
+                bits &= bits - 1;
+                c.st.sum += w * 64 + b;
+                c.st.count += 1;
+            }
+        }
+        return true;
+    }
+};
+
+/// Callback-based single-layer slice iterator factory.
+/// Callbacks take (Ctx, *const BitTree, BitsSlice) and return bool (false stops the walk).
+///
+/// Scans words at `scan_layer` and emits ascending, non-overlapping slices in
+/// `scan_layer` units. Consecutive full uniform words are coalesced into one
+/// cross-word slice; other words emit per-run slices in ascending slot order.
+/// Mixed and deep slots are never descended into: the receiver gets a slice
+/// and descends via `stepSlice` only if it needs to. A deep slice additionally
+/// hints that the whole subtree below is fragmented, so the receiver may jump
+/// straight to layer 0 instead of stepping level by level.
+/// `stepSlice(slice)` processes the covered `scan_layer` range of an input
+/// slice with `slice.layer >= scan_layer`; `runAll()` scans the whole layer.
+/// A null callback prunes that polarity at comptime (no mask work emitted for
+/// pruned uniform polarities beyond classification). When `on_deep_mixed` is
+/// null, deep slices fall back to `on_mixed`.
+/// Returns false on the first callback that returns false, true otherwise.
+/// Never allocates. Portable: no SIMD, no BMI, only ctz + shifts.
+pub fn LayerSlicesIterator(
+    comptime Ctx: type,
+    comptime scan_layer: u32,
+    comptime on_active: ?fn (Ctx, *const BitTree, BitsSlice) bool,
+    comptime on_inactive: ?fn (Ctx, *const BitTree, BitsSlice) bool,
+    comptime on_mixed: ?fn (Ctx, *const BitTree, BitsSlice) bool,
+    comptime on_deep_mixed: ?fn (Ctx, *const BitTree, BitsSlice) bool,
+) type {
+    if (on_active == null and on_inactive == null and on_mixed == null and on_deep_mixed == null)
+        @compileError("at least one callback required");
+    // Deep falls back to mixed so callers that do not distinguish
+    // shallow/deep only set on_mixed. The reverse is not allowed: a shallow
+    // slice must never reach on_deep_mixed (its subtree may hold uniform nodes).
+    const on_deep: ?fn (Ctx, *const BitTree, BitsSlice) bool = if (on_deep_mixed != null) on_deep_mixed else on_mixed;
+    return struct {
+        inline fn emitSlice(ctx: Ctx, tree: *const BitTree, start: u64, end: u64, comptime cb: ?fn (Ctx, *const BitTree, BitsSlice) bool) bool {
+            const f = cb orelse return true;
+            if (start >= end) return true;
+            return f(ctx, tree, .{
+                .start = @intCast(start),
+                .end = @intCast(end),
+                .layer = @intCast(scan_layer),
+            });
+        }
+
+        /// Length of the same-polarity run starting at slot `s` in `mask`.
+        inline fn runLen(mask: u64, s: u32) u32 {
+            const shifted: u64 = mask >> @as(u6, @intCast(s));
+            var r: u32 = @ctz(~shifted);
+            const max: u32 = 64 - s;
+            if (r > max) r = max;
+            return r;
+        }
+
+        /// Mask that clears the `[s, s+r)` run bits (for advancing `rest`).
+        inline fn clearRun(s: u32, r: u32) u64 {
+            const w: u64 = if (r >= 64) all_ones else ((@as(u64, 1) << @as(u6, @intCast(r))) - 1);
+            return ~(w << @as(u6, @intCast(s)));
         }
 
         inline fn rangeMask64(lo: u64, hi: u64) u64 {
@@ -792,216 +1069,140 @@ pub fn LayerBitsIterator(
             return (((~@as(u64, 0)) >> w6) << l6);
         }
 
-        // Deep-mixed jump is only valid when the final output is raw bits.
-        // `iterateTargetBits` chains always use out 0 for uniform callbacks;
-        // coarse `out_layers` keep the old descent to preserve batching.
-        const deep_enabled: bool = (scan_layer >= 2) and (on_mixed != null) and (out_layers.active == 0) and (out_layers.inactive == 0);
-
-        // Single leaf word emitter with pre-resolved `allow` (no tail branch).
-        // Shared by the deep jump and the steady/tail split below.
-        inline fn emitLeafWord(ctx: Ctx, lw: u64, base_bit: u64, allow: u64) bool {
-            if (allow == 0) return true;
-            if (on_inactive == null) {
-                var bits: u64 = lw & allow;
-                while (bits != 0) {
-                    const b: u32 = @ctz(bits);
-                    bits &= bits - 1;
-                    if (on_active) |f| {
-                        if (!f(ctx, @intCast(base_bit + b))) return false;
-                    }
-                }
-                return true;
-            }
-            if (on_active == null) {
-                var bits: u64 = ~lw & allow;
-                while (bits != 0) {
-                    const b: u32 = @ctz(bits);
-                    bits &= bits - 1;
-                    if (on_inactive) |f| {
-                        if (!f(ctx, @intCast(base_bit + b))) return false;
-                    }
-                }
-                return true;
-            }
-            var wanted: u64 = allow;
-            while (wanted != 0) {
-                const b: u32 = @ctz(wanted);
-                wanted &= wanted - 1;
-                const is_active = ((lw >> @as(u6, @intCast(b))) & 1) == 1;
-                if (is_active) {
-                    if (on_active) |f| {
-                        if (!f(ctx, @intCast(base_bit + b))) return false;
-                    }
-                } else {
-                    if (on_inactive) |f| {
-                        if (!f(ctx, @intCast(base_bit + b))) return false;
-                    }
-                }
-            }
-            return true;
-        }
-
-        // Deep range scan over prepared leaf storage: steady full words with
-        // `all_ones`, tree-tail word once with `tailMask`. No per-word branch.
-        inline fn scanDeepPrepared(ctx: Ctx, leaves: []const u64, total_words: u64, tailMask: u64, leaf_base: u64, leaf_cnt: u64) bool {
-            if (leaf_cnt == 0) return true;
-            if (total_words == 0) return true;
-            if (leaves.len == 0) return true;
-            if (leaf_base >= total_words) return true;
-            var end: u64 = leaf_base + leaf_cnt;
-            if (end > total_words) end = total_words;
-            if (end > leaves.len) end = leaves.len;
-            const eff: u64 = @min(total_words, @as(u64, leaves.len));
-            if (eff == 0) return true;
-            // Steady part excludes the tree-tail word unless it is full.
-            const last_idx: u64 = eff - 1;
-            const steady_end: u64 = if (tailMask == all_ones) end else @min(end, last_idx);
-            var lw_idx: u64 = leaf_base;
-            while (lw_idx < steady_end) : (lw_idx += 1) {
-                const wi: usize = @intCast(lw_idx);
-                if (!emitLeafWord(ctx, leaves[wi], lw_idx << 6, all_ones)) return false;
-            }
-            if (end > last_idx and last_idx >= leaf_base and tailMask != all_ones) {
-                const wi: usize = @intCast(last_idx);
-                if (!emitLeafWord(ctx, leaves[wi], last_idx << 6, tailMask)) return false;
-            } else {
-                // Tail is full or not in range: remaining words (at most one)
-                // are full. Handles tailMask==all_ones without extra branch above.
-                while (lw_idx < end) : (lw_idx += 1) {
-                    const wi: usize = @intCast(lw_idx);
-                    if (!emitLeafWord(ctx, leaves[wi], lw_idx << 6, all_ones)) return false;
-                }
-            }
-            return true;
-        }
-
-        inline fn processWord(ctx: Ctx, tree: *const BitTree, st_items: []const u64, mx_items: []const u64, w: usize, allowed: u64, total: u32) bool {
+        /// Processes one word's `allowed` slots. `pend_pol`/`pend_start`/`pend_end`
+        /// carry an open uniform run across words: 0=none, 1=active, 2=inactive.
+        /// Pending runs are always flushed before any callback of a later word,
+        /// so delivery stays strictly ascending even with early stop.
+        inline fn processWord(
+            ctx: Ctx,
+            tree: *const BitTree,
+            st_items: []const u64,
+            mx_items: []const u64,
+            w: usize,
+            allowed: u64,
+            pend_pol: *u2,
+            pend_start: *u64,
+            pend_end: *u64,
+        ) bool {
             if (allowed == 0) return true;
             const st: u64 = st_items[w];
-            const mx: u64 = mx_items[w];
-            const m_all: u64 = mx & allowed;
+            const mx: u64 = if (comptime scan_layer == 0) 0 else mx_items[w];
             const a_all: u64 = st & ~mx & allowed;
-            // Fast paths for single-polarity scans without descent: every wanted
-            // slot shares one class, so per-slot classification is skipped.
-            // Totals are computed lazily: untouched polarities cost zero.
-            if (on_mixed == null) {
-                if (on_inactive == null) {
-                    if (a_all == 0) return true;
-                    const t_a: u64 = totalIdsForLayer(total, out_layers.active);
-                    var rest: u64 = a_all;
-                    while (rest != 0) {
-                        const s: u32 = @ctz(rest);
-                        rest &= rest - 1;
-                        if (!emitOne(ctx, @as(u64, w) * 64 + s, out_layers.active, on_active, t_a)) return false;
-                    }
-                    return true;
-                }
-                if (on_active == null) {
-                    const i_all: u64 = allowed & ~m_all & ~a_all;
-                    if (i_all == 0) return true;
-                    const t_i: u64 = totalIdsForLayer(total, out_layers.inactive);
-                    var rest: u64 = i_all;
-                    while (rest != 0) {
-                        const s: u32 = @ctz(rest);
-                        rest &= rest - 1;
-                        if (!emitOne(ctx, @as(u64, w) * 64 + s, out_layers.inactive, on_inactive, t_i)) return false;
-                    }
-                    return true;
-                }
-            }
-            if (comptime deep_enabled) {
-                const deep_all: u64 = st & mx & allowed;
-                if (deep_all != 0) {
-                    const leaves = tree.levels.items[0].state.items;
-                    if (leaves.len == 0) return true;
-                    const total_words: u64 = (@as(u64, total) + 63) >> 6;
-                    const tailMask: u64 = lastLeafMask(total);
-                    // Whole-word deep: one contiguous leaf range, no totals needed.
-                    if (deep_all == allowed) {
-                        const sh_word: u6 = comptime @intCast(6 * scan_layer);
-                        const leaf_base: u64 = @as(u64, w) << sh_word;
-                        const leaf_cnt: u64 = comptime (@as(u64, 1) << sh_word);
-                        if (!scanDeepPrepared(ctx, leaves, total_words, tailMask, leaf_base, leaf_cnt)) return false;
+            const sh_all: u64 = ~st & mx & allowed;
+            const dp_all: u64 = st & mx & allowed;
+            const i_all: u64 = allowed & ~mx & ~st;
+            const w_base: u64 = @as(u64, w) * 64;
+
+            // Fast path: a fully uniform full word extends the pending
+            // cross-word run (or opens one). Anything else flushes first.
+            if (allowed == all_ones) {
+                if (a_all == all_ones) {
+                    if (on_active != null) {
+                        if (pend_pol.* == 2) {
+                            if (!emitSlice(ctx, tree, pend_start.*, pend_end.*, on_inactive)) return false;
+                        }
+                        if (pend_pol.* != 1) {
+                            pend_pol.* = 1;
+                            pend_start.* = w_base;
+                        }
+                        pend_end.* = w_base + 64;
                         return true;
                     }
-                    // Partially deep word: keep ascending order, deep slots jump,
-                    // the rest use the normal mixed/uniform path. Totals only
-                    // for the classes actually present.
-                    const shallow_all: u64 = m_all & ~deep_all;
-                    var t_m: u64 = undefined;
-                    var need_m: bool = false;
-                    if (on_mixed != null and shallow_all != 0) {
-                        t_m = totalIdsForLayer(total, out_layers.mixed);
-                        need_m = true;
+                    // Pruned polarity still breaks the other pending run.
+                    if (pend_pol.* == 2) {
+                        if (!emitSlice(ctx, tree, pend_start.*, pend_end.*, on_inactive)) return false;
+                        pend_pol.* = 0;
                     }
-                    var t_a2: u64 = undefined;
-                    if (on_active != null and a_all != 0) t_a2 = totalIdsForLayer(total, out_layers.active);
-                    var t_i2: u64 = undefined;
-                    const i_all: u64 = allowed & ~m_all & ~a_all;
-                    if (on_inactive != null and i_all != 0) t_i2 = totalIdsForLayer(total, out_layers.inactive);
-                    const sh_slot: u6 = comptime @intCast(6 * (scan_layer - 1));
-                    const slot_cnt: u64 = comptime (@as(u64, 1) << sh_slot);
-                    var rest: u64 = m_all;
-                    if (on_active != null) rest |= a_all;
-                    if (on_inactive != null) rest |= i_all;
-                    while (rest != 0) {
-                        const s: u32 = @ctz(rest);
-                        rest &= rest - 1;
-                        const bitm: u64 = @as(u64, 1) << @as(u6, @intCast(s));
-                        const id_scan: u64 = @as(u64, w) * 64 + s;
-                        if ((deep_all & bitm) != 0) {
-                            if (!scanDeepPrepared(ctx, leaves, total_words, tailMask, id_scan << sh_slot, slot_cnt)) return false;
-                        } else if (need_m and (shallow_all & bitm) != 0) {
-                            if (!emitMixedOne(ctx, tree, id_scan, out_layers.mixed, on_mixed, t_m)) return false;
-                        } else if (on_active != null and (a_all & bitm) != 0) {
-                            if (!emitOne(ctx, id_scan, out_layers.active, on_active, t_a2)) return false;
-                        } else if (on_inactive != null) {
-                            if (!emitOne(ctx, id_scan, out_layers.inactive, on_inactive, t_i2)) return false;
+                    return true;
+                }
+                if (i_all == all_ones) {
+                    if (on_inactive != null) {
+                        if (pend_pol.* == 1) {
+                            if (!emitSlice(ctx, tree, pend_start.*, pend_end.*, on_active)) return false;
                         }
+                        if (pend_pol.* != 2) {
+                            pend_pol.* = 2;
+                            pend_start.* = w_base;
+                        }
+                        pend_end.* = w_base + 64;
+                        return true;
+                    }
+                    if (pend_pol.* == 1) {
+                        if (!emitSlice(ctx, tree, pend_start.*, pend_end.*, on_active)) return false;
+                        pend_pol.* = 0;
                     }
                     return true;
                 }
             }
-            // Generic path: totals only for classes actually present.
-            var t_a: u64 = undefined;
-            if (on_active != null and a_all != 0) t_a = totalIdsForLayer(total, out_layers.active);
-            var t_m: u64 = undefined;
-            if (on_mixed != null and m_all != 0) t_m = totalIdsForLayer(total, out_layers.mixed);
-            var t_i: u64 = undefined;
-            const i_all: u64 = allowed & ~m_all & ~a_all;
-            if (on_inactive != null and i_all != 0) t_i = totalIdsForLayer(total, out_layers.inactive);
+            // Generic path: flush any pending run, then emit ascending runs.
+            if (pend_pol.* == 1) {
+                if (!emitSlice(ctx, tree, pend_start.*, pend_end.*, on_active)) return false;
+                pend_pol.* = 0;
+            } else if (pend_pol.* == 2) {
+                if (!emitSlice(ctx, tree, pend_start.*, pend_end.*, on_inactive)) return false;
+                pend_pol.* = 0;
+            }
             var rest: u64 = 0;
-            if (on_mixed != null) rest |= m_all;
             if (on_active != null) rest |= a_all;
             if (on_inactive != null) rest |= i_all;
+            if (on_mixed != null) rest |= sh_all;
+            if (on_deep != null) rest |= dp_all;
             while (rest != 0) {
                 const s: u32 = @ctz(rest);
-                rest &= rest - 1;
                 const bitm: u64 = @as(u64, 1) << @as(u6, @intCast(s));
-                const id_scan: u64 = @as(u64, w) * 64 + s;
-                if (on_mixed != null and (m_all & bitm) != 0) {
-                    if (!emitMixedOne(ctx, tree, id_scan, out_layers.mixed, on_mixed, t_m)) return false;
+                if (on_mixed != null and (sh_all & bitm) != 0) {
+                    const r = runLen(sh_all, s);
+                    if (!emitSlice(ctx, tree, w_base + s, w_base + s + r, on_mixed)) return false;
+                    rest &= clearRun(s, r);
+                } else if (on_deep != null and (dp_all & bitm) != 0) {
+                    const r = runLen(dp_all, s);
+                    if (!emitSlice(ctx, tree, w_base + s, w_base + s + r, on_deep)) return false;
+                    rest &= clearRun(s, r);
                 } else if (on_active != null and (a_all & bitm) != 0) {
-                    if (!emitOne(ctx, id_scan, out_layers.active, on_active, t_a)) return false;
-                } else if (on_inactive != null) {
-                    if (!emitOne(ctx, id_scan, out_layers.inactive, on_inactive, t_i)) return false;
+                    const r = runLen(a_all, s);
+                    if (!emitSlice(ctx, tree, w_base + s, w_base + s + r, on_active)) return false;
+                    rest &= clearRun(s, r);
+                } else {
+                    const r = runLen(i_all, s);
+                    if (on_inactive != null) {
+                        if (!emitSlice(ctx, tree, w_base + s, w_base + s + r, on_inactive)) return false;
+                    }
+                    rest &= clearRun(s, r);
                 }
             }
             return true;
         }
 
-        /// Processes one `in_layer` entry: the covered `scan_layer` word range.
-        /// Out-of-range ids are skipped. Returns false on early callback stop.
-        pub fn step(ctx: Ctx, tree: *const BitTree, id: u32) bool {
+        inline fn flushPending(ctx: Ctx, tree: *const BitTree, pend_pol: *u2, pend_start: *u64, pend_end: *u64) bool {
+            if (pend_pol.* == 1) {
+                pend_pol.* = 0;
+                if (!emitSlice(ctx, tree, pend_start.*, pend_end.*, on_active)) return false;
+            } else if (pend_pol.* == 2) {
+                pend_pol.* = 0;
+                if (!emitSlice(ctx, tree, pend_start.*, pend_end.*, on_inactive)) return false;
+            }
+            return true;
+        }
+
+        /// Processes the covered `scan_layer` range of an input slice.
+        /// Slices with `layer < scan_layer`, empty or out-of-range slices are
+        /// silent no-ops. Returns false on early callback stop.
+        pub fn stepSlice(ctx: Ctx, tree: *const BitTree, slice: BitsSlice) bool {
             const total = tree.total_bits;
             if (total == 0) return true;
             if (scan_layer >= tree.levels.items.len) return true;
-            const total_in: u64 = totalIdsForLayer(total, in_layer);
-            if (@as(u64, id) >= total_in) return true;
-            const d_in: u32 = comptime (in_layer - scan_layer);
-            const sh_in: u6 = comptime if (d_in == 0) @as(u6, 0) else @intCast(6 * d_in);
-            const base: u64 = if (comptime d_in == 0) id else @as(u64, id) << sh_in;
-            var cnt: u64 = if (comptime d_in == 0) 1 else comptime (@as(u64, 1) << sh_in);
+            const sl: u32 = slice.layer;
+            if (sl >= max_levels) return true;
+            if (sl < scan_layer) return true;
+            if (slice.end <= slice.start) return true;
+            const total_in: u64 = totalIdsForLayer(total, sl);
+            if (@as(u64, slice.start) >= total_in) return true;
+            var end: u64 = slice.end;
+            if (end > total_in) end = total_in;
+            const d: u32 = sl - scan_layer;
+            const sh: u6 = @intCast(6 * d);
+            const base: u64 = @as(u64, slice.start) << sh;
+            var cnt: u64 = (end - @as(u64, slice.start)) << sh;
             const total_scan: u64 = totalIdsForLayer(total, scan_layer);
             if (base >= total_scan) return true;
             if (base + cnt > total_scan) cnt = total_scan - base;
@@ -1010,6 +1211,9 @@ pub fn LayerBitsIterator(
             const words: usize = st_items.len;
             const w_first: usize = @intCast(base >> 6);
             const w_last: usize = @intCast((base + cnt - 1) >> 6);
+            var pend_pol: u2 = 0;
+            var pend_start: u64 = 0;
+            var pend_end: u64 = 0;
             var w: usize = w_first;
             while (w <= w_last) : (w += 1) {
                 if (w >= words) break;
@@ -1022,29 +1226,9 @@ pub fn LayerBitsIterator(
                 const trem: u64 = if (w_base >= total_scan) 0 else total_scan - w_base;
                 if (trem == 0) continue;
                 allowed &= slotsValidMask(@min(trem, @as(u64, 64)));
-                if (!processWord(ctx, tree, st_items, mx_items, w, allowed, total)) return false;
+                if (!processWord(ctx, tree, st_items, mx_items, w, allowed, &pend_pol, &pend_start, &pend_end)) return false;
             }
-            return true;
-        }
-
-        /// Processes one word `w` at `scan_layer` directly (full word ∩ tail).
-        /// Fast path for chains: a parent mixed id at this scan granularity is
-        /// exactly a word index here, so no range expansion is needed.
-        /// Out-of-range words are skipped. Returns false on early callback stop.
-        pub fn stepWord(ctx: Ctx, tree: *const BitTree, w: u32) bool {
-            const total = tree.total_bits;
-            if (total == 0) return true;
-            if (scan_layer >= tree.levels.items.len) return true;
-            const st_items: []const u64 = tree.levels.items[scan_layer].state.items;
-            const mx_items: []const u64 = tree.levels.items[scan_layer].mixed.items;
-            const wi: usize = w;
-            if (wi >= st_items.len) return true;
-            const total_scan: u64 = totalIdsForLayer(total, scan_layer);
-            const base: u64 = @as(u64, wi) * 64;
-            if (base >= total_scan) return true;
-            const trem: u64 = total_scan - base;
-            const allowed: u64 = slotsValidMask(@min(trem, @as(u64, 64)));
-            return processWord(ctx, tree, st_items, mx_items, wi, allowed, total);
+            return flushPending(ctx, tree, &pend_pol, &pend_start, &pend_end);
         }
 
         /// Processes every word at `scan_layer` in ascending order.
@@ -1057,150 +1241,28 @@ pub fn LayerBitsIterator(
             const st_items: []const u64 = tree.levels.items[scan_layer].state.items;
             const mx_items: []const u64 = tree.levels.items[scan_layer].mixed.items;
             const words: usize = st_items.len;
+            var pend_pol: u2 = 0;
+            var pend_start: u64 = 0;
+            var pend_end: u64 = 0;
             // All words but the last are fully valid: no per-word mask math.
             var w: usize = 0;
             const full_words: usize = @intCast(total_scan >> 6);
             const steady: usize = @min(full_words, words);
             while (w < steady) : (w += 1) {
-                if (!processWord(ctx, tree, st_items, mx_items, w, all_ones, total)) return false;
+                if (!processWord(ctx, tree, st_items, mx_items, w, all_ones, &pend_pol, &pend_start, &pend_end)) return false;
             }
             if (w < words) {
                 const base: u64 = @as(u64, w) * 64;
                 if (base < total_scan) {
-                    if (!processWord(ctx, tree, st_items, mx_items, w, slotsValidMask(total_scan - base), total)) return false;
+                    const rem: u64 = total_scan - base;
+                    if (!processWord(ctx, tree, st_items, mx_items, w, slotsValidMask(rem), &pend_pol, &pend_start, &pend_end)) return false;
                 }
             }
-            return true;
+            return flushPending(ctx, tree, &pend_pol, &pend_start, &pend_end);
         }
     };
 }
 
-/// Callback-based leaf iterator factory. Output is always raw bit ids (layer 0).
-/// `step(id)` treats `id` as one `in_layer` entry and classifies the covered bits;
-/// `runAll()` scans the whole bitmask. Ascending order, no allocation.
-pub fn BitsetIterator(
-    comptime Ctx: type,
-    comptime in_layer: u32,
-    comptime on_active: ?fn (Ctx, u32) bool,
-    comptime on_inactive: ?fn (Ctx, u32) bool,
-) type {
-    if (on_active == null and on_inactive == null) @compileError("at least one callback required");
-    return struct {
-        inline fn processLeafWord(ctx: Ctx, leaves: []const u64, w: usize, allowed: u64) bool {
-            if (allowed == 0) return true;
-            const lw: u64 = leaves[w];
-            const base: u64 = @as(u64, w) * 64;
-            // Fast paths for single-polarity scans: no per-bit classification.
-            if (on_inactive == null) {
-                var bits: u64 = lw & allowed;
-                while (bits != 0) {
-                    const s: u32 = @ctz(bits);
-                    bits &= bits - 1;
-                    if (on_active) |f| {
-                        if (!f(ctx, @intCast(base + s))) return false;
-                    }
-                }
-                return true;
-            }
-            if (on_active == null) {
-                var bits: u64 = ~lw & allowed;
-                while (bits != 0) {
-                    const s: u32 = @ctz(bits);
-                    bits &= bits - 1;
-                    if (on_inactive) |f| {
-                        if (!f(ctx, @intCast(base + s))) return false;
-                    }
-                }
-                return true;
-            }
-            var wanted: u64 = allowed;
-            while (wanted != 0) {
-                const s: u32 = @ctz(wanted);
-                wanted &= wanted - 1;
-                const is_active = ((lw >> @as(u6, @intCast(s))) & 1) == 1;
-                if (is_active) {
-                    if (on_active) |f| {
-                        if (!f(ctx, @intCast(base + s))) return false;
-                    }
-                } else {
-                    if (on_inactive) |f| {
-                        if (!f(ctx, @intCast(base + s))) return false;
-                    }
-                }
-            }
-            return true;
-        }
-
-        /// Classifies one `in_layer` entry (a single bit when `in_layer == 0`).
-        /// Out-of-range ids are skipped. Returns false on early callback stop.
-        pub fn step(ctx: Ctx, tree: *const BitTree, id: u32) bool {
-            const total = tree.total_bits;
-            if (total == 0) return true;
-            if (tree.levels.items.len == 0) return true;
-            const total_in: u64 = totalIdsForLayer(total, in_layer);
-            if (@as(u64, id) >= total_in) return true;
-            const sh: u6 = comptime @intCast(6 * in_layer);
-            const cnt0: u64 = comptime (@as(u64, 1) << sh);
-            const base: u64 = if (comptime in_layer == 0) id else @as(u64, id) << sh;
-            var cnt: u64 = if (comptime in_layer == 0) 1 else cnt0;
-            if (base >= total) return true;
-            if (base + cnt > total) cnt = @as(u64, total) - base;
-            const leaves = tree.levels.items[0].state.items;
-            if (leaves.len == 0) return true;
-            const tailMask: u64 = lastLeafMask(total);
-            const w_first: usize = @intCast(base >> 6);
-            const w_last: usize = @intCast((base + cnt - 1) >> 6);
-            var w: usize = w_first;
-            while (w <= w_last) : (w += 1) {
-                if (w >= leaves.len) break;
-                const w_base: u64 = @as(u64, w) * 64;
-                const w_end: u64 = w_base + 64;
-                const lo: u64 = if (base > w_base) base - w_base else 0;
-                const hi: u64 = if (base + cnt < w_end) base + cnt - w_base else 64;
-                if (hi <= lo) continue;
-                const width: u32 = @intCast(hi - lo);
-                var allowed: u64 = if (width == 64) all_ones else (((@as(u64, 1) << @as(u6, @intCast(width))) - 1) << @as(u6, @intCast(lo)));
-                if (w + 1 == leaves.len) allowed &= tailMask;
-                if (!processLeafWord(ctx, leaves, w, allowed)) return false;
-            }
-            return true;
-        }
-
-        /// Processes one leaf word `w` directly (full word ∩ tail).
-        /// Fast path for chains: a parent mixed id is exactly a leaf word index.
-        /// Out-of-range words are skipped. Returns false on early callback stop.
-        pub fn stepWord(ctx: Ctx, tree: *const BitTree, w: u32) bool {
-            const total = tree.total_bits;
-            if (total == 0) return true;
-            if (tree.levels.items.len == 0) return true;
-            const leaves = tree.levels.items[0].state.items;
-            const wi: usize = w;
-            if (wi >= leaves.len) return true;
-            const allowed: u64 = if (wi + 1 == leaves.len) lastLeafMask(total) else all_ones;
-            return processLeafWord(ctx, leaves, wi, allowed);
-        }
-
-        /// Classifies every bit in ascending order. Returns false on early stop.
-        pub fn runAll(ctx: Ctx, tree: *const BitTree) bool {
-            const total = tree.total_bits;
-            if (total == 0) return true;
-            if (tree.levels.items.len == 0) return true;
-            const leaves = tree.levels.items[0].state.items;
-            if (leaves.len == 0) return true;
-            // Steady full words without per-word tail branch; tail once.
-            const tailMask: u64 = lastLeafMask(total);
-            var w: usize = 0;
-            const steady: usize = if (tailMask == all_ones) leaves.len else leaves.len - 1;
-            while (w < steady) : (w += 1) {
-                if (!processLeafWord(ctx, leaves, w, all_ones)) return false;
-            }
-            if (w < leaves.len) {
-                if (!processLeafWord(ctx, leaves, w, tailMask)) return false;
-            }
-            return true;
-        }
-    };
-}
 pub const FlatBitSet = struct {
     const Self = @This();
 
@@ -1352,7 +1414,7 @@ pub const FlatBitSet = struct {
 
 // ---------------- tests ----------------
 
-// Shared collection context for callback tests: appends ids, bounds-checked.
+// Shared collection context for per-bit callback tests (iterateTargetBits oracle).
 const IdCollector = struct {
     buf: []u32,
     n: usize = 0,
@@ -1364,35 +1426,84 @@ const IdCollector = struct {
     }
 };
 
-// Three-way collection context for single-layer tests.
-const TriCollector = struct {
-    a_buf: []u32,
-    i_buf: []u32,
-    m_buf: []u32,
+// Slice collection context: appends whole slices, bounds-checked.
+const SliceCollector = struct {
+    buf: []BitsSlice,
+    n: usize = 0,
+    fn push(self: *SliceCollector, tree: *const BitTree, s: BitsSlice) bool {
+        _ = tree;
+        if (self.n >= self.buf.len) return false;
+        self.buf[self.n] = s;
+        self.n += 1;
+        return true;
+    }
+};
+
+// Four-way slice collection context, one buffer per polarity.
+const QuadCollector = struct {
+    a_buf: []BitsSlice,
+    i_buf: []BitsSlice,
+    m_buf: []BitsSlice,
+    d_buf: []BitsSlice,
     na: usize = 0,
     ni: usize = 0,
     nm: usize = 0,
-    fn pushA(self: *TriCollector, id: u32) bool {
+    nd: usize = 0,
+    fn pushA(self: *QuadCollector, tree: *const BitTree, s: BitsSlice) bool {
+        _ = tree;
         if (self.na >= self.a_buf.len) return false;
-        self.a_buf[self.na] = id;
+        self.a_buf[self.na] = s;
         self.na += 1;
         return true;
     }
-    fn pushI(self: *TriCollector, id: u32) bool {
+    fn pushI(self: *QuadCollector, tree: *const BitTree, s: BitsSlice) bool {
+        _ = tree;
         if (self.ni >= self.i_buf.len) return false;
-        self.i_buf[self.ni] = id;
+        self.i_buf[self.ni] = s;
         self.ni += 1;
         return true;
     }
-    fn pushM(self: *TriCollector, id: u32) bool {
+    fn pushM(self: *QuadCollector, tree: *const BitTree, s: BitsSlice) bool {
+        _ = tree;
         if (self.nm >= self.m_buf.len) return false;
-        self.m_buf[self.nm] = id;
+        self.m_buf[self.nm] = s;
         self.nm += 1;
         return true;
     }
-    fn pushMt(self: *TriCollector, tree: *const BitTree, id: u32) bool {
+    fn pushD(self: *QuadCollector, tree: *const BitTree, s: BitsSlice) bool {
         _ = tree;
-        return self.pushM(id);
+        if (self.nd >= self.d_buf.len) return false;
+        self.d_buf[self.nd] = s;
+        self.nd += 1;
+        return true;
+    }
+};
+
+// Test-only per-bit expander for direct stepSlice chains.
+const BitPush = struct {
+    coll: *IdCollector,
+    pub fn active(c: BitPush, tree: *const BitTree, s: BitsSlice) bool {
+        _ = tree;
+        const sh: u6 = @intCast(@as(u32, s.layer) * 6);
+        const base: u64 = @as(u64, s.start) << sh;
+        const cnt: u64 = (@as(u64, s.end) - @as(u64, s.start)) << sh;
+        var k: u64 = 0;
+        while (k < cnt) : (k += 1) {
+            if (!c.coll.push(@intCast(base + k))) return false;
+        }
+        return true;
+    }
+};
+
+// Early-break context over slices: stops after exactly `limit` callbacks.
+const SliceBreakCtx = struct {
+    calls: usize = 0,
+    limit: usize,
+    fn cb(self: *SliceBreakCtx, tree: *const BitTree, s: BitsSlice) bool {
+        _ = tree;
+        _ = s;
+        self.calls += 1;
+        return self.calls < self.limit;
     }
 };
 
@@ -1407,19 +1518,70 @@ const BreakCtx = struct {
     }
 };
 
-test "empty tree iterator apis" {
+// Validates ascending, non-overlapping coverage of `seen` by one slice list.
+fn checkSliceList(slices: []const BitsSlice, n: usize, layer: u8, seen: []bool) !void {
+    var k: usize = 0;
+    var first = true;
+    var prev_end: u32 = 0;
+    while (k < n) : (k += 1) {
+        const s = slices[k];
+        try std.testing.expectEqual(layer, s.layer);
+        try std.testing.expect(s.end > s.start);
+        if (!first) try std.testing.expect(s.start >= prev_end);
+        first = false;
+        prev_end = s.end;
+        var id: u32 = s.start;
+        while (id < s.end) : (id += 1) {
+            try std.testing.expect(id < seen.len);
+            try std.testing.expect(!seen[id]);
+            seen[id] = true;
+        }
+    }
+}
+
+// Validates slice purity against the naive bit model.
+// Uniform slices must be pure, mixed/deep slices must contain both states.
+fn checkSlicePurity(s: BitsSlice, expect_mixed: bool, tree: *const BitTree, total_bits: u32) !void {
+    const base: u64 = s.bitBase();
+    try std.testing.expect(base < total_bits);
+    const blen: u64 = @min(s.bitLen(), @as(u64, total_bits) - base);
+    try std.testing.expect(blen > 0);
+    var saw_a = false;
+    var saw_i = false;
+    var b: u64 = 0;
+    while (b < blen) : (b += 1) {
+        if (tree.getBit(@intCast(base + b))) {
+            saw_a = true;
+        } else {
+            saw_i = true;
+        }
+        if (saw_a and saw_i) break;
+    }
+    if (expect_mixed) {
+        try std.testing.expect(saw_a and saw_i);
+    } else {
+        try std.testing.expect(saw_a != saw_i);
+    }
+}
+
+test "slices: empty tree" {
     const alloc = std.testing.allocator;
     var tree = BitTree.empty;
     defer tree.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 0), tree.totalBitsCount());
     try std.testing.expectEqual(@as(u32, 0), tree.count(.active));
-    var buf: [4]u32 = undefined;
-    var coll = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(tree.iterateTargetBits(*IdCollector, &coll, IdCollector.push, IdCollector.push));
+    var buf: [4]BitsSlice = undefined;
+    var coll = SliceCollector{ .buf = buf[0..] };
+    const L0 = LayerSlicesIterator(*SliceCollector, 0, SliceCollector.push, SliceCollector.push, SliceCollector.push, SliceCollector.push);
+    try std.testing.expect(L0.runAll(&coll, &tree));
     try std.testing.expectEqual(@as(usize, 0), coll.n);
-    const Leaf = BitsetIterator(*IdCollector, 0, IdCollector.push, null);
-    try std.testing.expect(Leaf.runAll(&coll, &tree));
+    const L1 = LayerSlicesIterator(*SliceCollector, 1, SliceCollector.push, null, null, null);
+    try std.testing.expect(L1.runAll(&coll, &tree));
     try std.testing.expectEqual(@as(usize, 0), coll.n);
+    var ids: [4]u32 = undefined;
+    var bits = IdCollector{ .buf = ids[0..] };
+    try std.testing.expect(tree.iterateTargetBits(*IdCollector, &bits, IdCollector.push, IdCollector.push));
+    try std.testing.expectEqual(@as(usize, 0), bits.n);
 }
 
 test "setBit/getBit small" {
@@ -1486,58 +1648,37 @@ test "setRange and clear dual mask" {
     try std.testing.expectEqual(@as(u32, 300), tree.count(.active));
 }
 
-test "layer iterator single stage exact order" {
+test "slices: L1 exact partition vs naive" {
     const alloc = std.testing.allocator;
     var tree = BitTree.empty;
     defer tree.deinit(alloc);
     try tree.resize(alloc, 5000, .inactive);
     tree.setRange(1000, 3000, .active);
+    tree.setBit(0, true);
+    tree.setBit(4999, true);
     // L1 has ceil(5000/64) = 79 ids in 2 words.
-    var a_buf: [256]u32 = undefined;
-    var i_buf: [256]u32 = undefined;
-    var m_buf: [256]u32 = undefined;
-    var t = TriCollector{ .a_buf = a_buf[0..], .i_buf = i_buf[0..], .m_buf = m_buf[0..] };
-    const L1 = LayerBitsIterator(*TriCollector, 1, 1, .{ .active = 1, .inactive = 1, .mixed = 1 }, TriCollector.pushA, TriCollector.pushI, TriCollector.pushMt);
-    try std.testing.expect(L1.runAll(&t, &tree));
-    try std.testing.expectEqual(@as(usize, 79), t.na + t.ni + t.nm);
-    try std.testing.expect(t.na > 0 and t.ni > 0 and t.nm > 0);
-    // Exact ascending partition against a naive per-span classification.
-    var ia: usize = 0;
-    var ii: usize = 0;
-    var im: usize = 0;
-    var id: u32 = 0;
-    while (id < 79) : (id += 1) {
-        var saw_a = false;
-        var saw_i = false;
-        var b: u64 = @as(u64, id) * 64;
-        const end: u64 = @min(b + 64, 5000);
-        while (b < end) : (b += 1) {
-            if (tree.getBit(@intCast(b))) {
-                saw_a = true;
-            } else {
-                saw_i = true;
-            }
-        }
-        if (saw_a and saw_i) {
-            try std.testing.expect(im < t.nm);
-            try std.testing.expectEqual(id, t.m_buf[im]);
-            im += 1;
-        } else if (saw_a) {
-            try std.testing.expect(ia < t.na);
-            try std.testing.expectEqual(id, t.a_buf[ia]);
-            ia += 1;
-        } else {
-            try std.testing.expect(ii < t.ni);
-            try std.testing.expectEqual(id, t.i_buf[ii]);
-            ii += 1;
-        }
-    }
-    try std.testing.expectEqual(t.na, ia);
-    try std.testing.expectEqual(t.ni, ii);
-    try std.testing.expectEqual(t.nm, im);
+    var a_buf: [80]BitsSlice = undefined;
+    var i_buf: [80]BitsSlice = undefined;
+    var m_buf: [80]BitsSlice = undefined;
+    var d_buf: [80]BitsSlice = undefined;
+    var q = QuadCollector{ .a_buf = a_buf[0..], .i_buf = i_buf[0..], .m_buf = m_buf[0..], .d_buf = d_buf[0..] };
+    const L1 = LayerSlicesIterator(*QuadCollector, 1, QuadCollector.pushA, QuadCollector.pushI, QuadCollector.pushM, QuadCollector.pushD);
+    try std.testing.expect(L1.runAll(&q, &tree));
+    try std.testing.expect(q.na > 0 and q.ni > 0);
+    try std.testing.expect(q.nm + q.nd > 0);
+    var seen = [_]bool{false} ** 79;
+    try checkSliceList(a_buf[0..q.na], q.na, 1, seen[0..]);
+    try checkSliceList(i_buf[0..q.ni], q.ni, 1, seen[0..]);
+    try checkSliceList(m_buf[0..q.nm], q.nm, 1, seen[0..]);
+    try checkSliceList(d_buf[0..q.nd], q.nd, 1, seen[0..]);
+    for (seen) |v| try std.testing.expect(v);
+    for (a_buf[0..q.na]) |s| try checkSlicePurity(s, false, &tree, 5000);
+    for (i_buf[0..q.ni]) |s| try checkSlicePurity(s, false, &tree, 5000);
+    for (m_buf[0..q.nm]) |s| try checkSlicePurity(s, true, &tree, 5000);
+    for (d_buf[0..q.nd]) |s| try checkSlicePurity(s, true, &tree, 5000);
 }
 
-test "manual chain L2-L1-leaf exact bits" {
+test "slices: chain stepSlice exact bits" {
     const alloc = std.testing.allocator;
     var tree = BitTree.empty;
     defer tree.deinit(alloc);
@@ -1545,71 +1686,42 @@ test "manual chain L2-L1-leaf exact bits" {
     tree.setRange(0, 5000, .active);
     var buf: [5000]u32 = undefined;
     var coll = IdCollector{ .buf = buf[0..] };
-    const Leaf = BitsetIterator(*IdCollector, 1, IdCollector.push, null);
-    const L1 = LayerBitsIterator(*IdCollector, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, IdCollector.push, null, Leaf.step);
-    const L2 = LayerBitsIterator(*IdCollector, 2, 2, .{ .active = 0, .inactive = 0, .mixed = 2 }, IdCollector.push, null, L1.step);
-    try std.testing.expect(L2.runAll(&coll, &tree));
+    const bp = BitPush{ .coll = &coll };
+    const Leaf = LayerSlicesIterator(BitPush, 0, BitPush.active, null, null, null);
+    const L1 = LayerSlicesIterator(BitPush, 1, BitPush.active, null, Leaf.stepSlice, null);
+    const L2 = LayerSlicesIterator(BitPush, 2, BitPush.active, null, L1.stepSlice, null);
+    try std.testing.expect(L2.runAll(bp, &tree));
     // Active set is exactly [0, 5000), ascending by depth-first order.
     try std.testing.expectEqual(@as(usize, 5000), coll.n);
     var k: usize = 0;
     while (k < coll.n) : (k += 1) {
         try std.testing.expectEqual(@as(u32, @intCast(k)), coll.buf[k]);
     }
-    // Restricted step: L2 id 1 covers bits [4096, 8192); actives are [4096, 5000).
+    // Restricted stepSlice: L2 slice {1,2} covers bits [4096, 8192); actives are [4096, 5000).
     var coll2 = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(L2.step(&coll2, &tree, 1));
+    const bp2 = BitPush{ .coll = &coll2 };
+    try std.testing.expect(L2.stepSlice(bp2, &tree, .{ .start = 1, .end = 2, .layer = 2 }));
     try std.testing.expectEqual(@as(usize, 904), coll2.n);
     var j: usize = 0;
     while (j < coll2.n) : (j += 1) {
         try std.testing.expectEqual(@as(u32, @intCast(4096 + j)), coll2.buf[j]);
     }
-    // Out-of-range step is a silent no-op.
+    // Out-of-range and wrong-layer slices are silent no-ops.
     var coll3 = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(L2.step(&coll3, &tree, 9999));
+    const bp3 = BitPush{ .coll = &coll3 };
+    try std.testing.expect(L2.stepSlice(bp3, &tree, .{ .start = 9999, .end = 10000, .layer = 2 }));
     try std.testing.expectEqual(@as(usize, 0), coll3.n);
-}
-
-test "manual chain via stepWord exact bits" {
-    const alloc = std.testing.allocator;
-    var tree = BitTree.empty;
-    defer tree.deinit(alloc);
-    try tree.resize(alloc, 20000, .inactive);
-    tree.setRange(0, 5000, .active);
-    var buf: [5000]u32 = undefined;
-    var coll = IdCollector{ .buf = buf[0..] };
-    const Leaf = BitsetIterator(*IdCollector, 1, IdCollector.push, null);
-    const L1 = LayerBitsIterator(*IdCollector, 1, 2, .{ .active = 0, .inactive = 0, .mixed = 1 }, IdCollector.push, null, Leaf.stepWord);
-    const L2 = LayerBitsIterator(*IdCollector, 2, 2, .{ .active = 0, .inactive = 0, .mixed = 2 }, IdCollector.push, null, L1.stepWord);
-    try std.testing.expect(L2.runAll(&coll, &tree));
-    try std.testing.expectEqual(@as(usize, 5000), coll.n);
-    var k: usize = 0;
-    while (k < coll.n) : (k += 1) {
-        try std.testing.expectEqual(@as(u32, @intCast(k)), coll.buf[k]);
-    }
-    // Direct stepWord: L1 word 1 holds ids [64, 128): 64..77 uniform active,
-    // 78 mixed ([4992, 5000) active of 64), 79..127 uniform inactive.
-    var w1 = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(L1.stepWord(&w1, &tree, 1));
-    try std.testing.expectEqual(@as(usize, 904), w1.n);
-    var j: usize = 0;
-    while (j < w1.n) : (j += 1) {
-        try std.testing.expectEqual(@as(u32, @intCast(4096 + j)), w1.buf[j]);
-    }
-    // L1 word 0 is fully uniform active: 64*64 bits.
-    var w0 = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(L1.stepWord(&w0, &tree, 0));
-    try std.testing.expectEqual(@as(usize, 4096), w0.n);
-    // OOB word is a silent no-op.
-    var wbad = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(L1.stepWord(&wbad, &tree, 9999));
-    try std.testing.expectEqual(@as(usize, 0), wbad.n);
-    // Leaf tail word 312 ([19968, 20000)) is uniform inactive: nothing.
+    try std.testing.expect(L1.stepSlice(bp3, &tree, .{ .start = 5, .end = 6, .layer = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), coll3.n);
+    // Leaf tail word ([19968, 20000)) is uniform inactive: nothing.
     var leaf_tail = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(Leaf.stepWord(&leaf_tail, &tree, 312));
+    const bpt = BitPush{ .coll = &leaf_tail };
+    try std.testing.expect(Leaf.stepSlice(bpt, &tree, .{ .start = 19968, .end = 20000, .layer = 0 }));
     try std.testing.expectEqual(@as(usize, 0), leaf_tail.n);
     // Leaf word 78 ([4992, 5056)) contributes its 8 active bits.
     var leaf78 = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(Leaf.stepWord(&leaf78, &tree, 78));
+    const bp78 = BitPush{ .coll = &leaf78 };
+    try std.testing.expect(Leaf.stepSlice(bp78, &tree, .{ .start = 4992, .end = 5056, .layer = 0 }));
     try std.testing.expectEqual(@as(usize, 8), leaf78.n);
     var q: usize = 0;
     while (q < leaf78.n) : (q += 1) {
@@ -1617,7 +1729,7 @@ test "manual chain via stepWord exact bits" {
     }
 }
 
-test "leaf iterator both polarities exact" {
+test "slices: leaf both polarities exact" {
     const alloc = std.testing.allocator;
     var tree = BitTree.empty;
     defer tree.deinit(alloc);
@@ -1625,62 +1737,136 @@ test "leaf iterator both polarities exact" {
     tree.setBit(3, true);
     tree.setBit(5, true);
     tree.setBit(64, true);
-    var a_buf: [8]u32 = undefined;
-    var i_buf: [200]u32 = undefined;
-    var t = TriCollector{ .a_buf = a_buf[0..], .i_buf = i_buf[0..], .m_buf = &[_]u32{} };
-    const Leaf = BitsetIterator(*TriCollector, 0, TriCollector.pushA, TriCollector.pushI);
-    try std.testing.expect(Leaf.runAll(&t, &tree));
-    try std.testing.expectEqual(@as(usize, 3), t.na);
-    try std.testing.expectEqual(@as(usize, 197), t.ni);
-    try std.testing.expectEqual(@as(u32, 3), t.a_buf[0]);
-    try std.testing.expectEqual(@as(u32, 5), t.a_buf[1]);
-    try std.testing.expectEqual(@as(u32, 64), t.a_buf[2]);
-    // Ascending and disjoint.
-    var k: usize = 1;
-    while (k < t.na) : (k += 1) try std.testing.expect(t.a_buf[k - 1] < t.a_buf[k]);
-    k = 1;
-    while (k < t.ni) : (k += 1) try std.testing.expect(t.i_buf[k - 1] < t.i_buf[k]);
-    try std.testing.expectEqual(@as(u32, 0), t.i_buf[0]);
-    // Restricted single-bit step classifies one bit.
-    var t2 = TriCollector{ .a_buf = a_buf[0..], .i_buf = i_buf[0..], .m_buf = &[_]u32{} };
-    try std.testing.expect(Leaf.step(&t2, &tree, 5));
-    try std.testing.expectEqual(@as(usize, 1), t2.na);
-    try std.testing.expectEqual(@as(usize, 0), t2.ni);
-    try std.testing.expect(Leaf.step(&t2, &tree, 6));
-    try std.testing.expectEqual(@as(usize, 1), t2.ni);
+    var a_buf: [8]BitsSlice = undefined;
+    var i_buf: [8]BitsSlice = undefined;
+    var q = QuadCollector{ .a_buf = a_buf[0..], .i_buf = i_buf[0..], .m_buf = &[_]BitsSlice{}, .d_buf = &[_]BitsSlice{} };
+    const Leaf = LayerSlicesIterator(*QuadCollector, 0, QuadCollector.pushA, QuadCollector.pushI, null, null);
+    try std.testing.expect(Leaf.runAll(&q, &tree));
+    // Words 0..1 are fragmented, words 2..3 coalesce: 3 active + 6 inactive slices.
+    try std.testing.expectEqual(@as(usize, 3), q.na);
+    try std.testing.expectEqual(@as(usize, 6), q.ni);
+    var seen = [_]bool{false} ** 200;
+    try checkSliceList(a_buf[0..q.na], q.na, 0, seen[0..]);
+    try checkSliceList(i_buf[0..q.ni], q.ni, 0, seen[0..]);
+    for (seen) |v| try std.testing.expect(v);
+    try std.testing.expect(tree.getBit(a_buf[0].start));
+    try std.testing.expectEqual(@as(u32, 3), a_buf[0].start);
+    try std.testing.expectEqual(@as(u32, 5), a_buf[1].start);
+    try std.testing.expectEqual(@as(u32, 64), a_buf[2].start);
 }
 
-test "OutLayers split granularities" {
+test "slices: four-polarity split at L2" {
     const alloc = std.testing.allocator;
     var tree = BitTree.empty;
     defer tree.deinit(alloc);
     try tree.resize(alloc, 20000, .inactive);
     tree.setRange(0, 5000, .active);
-    // Active as bits (0), inactive as L1 ids (1), mixed as L2 ids (2).
-    var a_buf: [5000]u32 = undefined;
-    var i_buf: [313]u32 = undefined;
-    var m_buf: [16]u32 = undefined;
-    var t = TriCollector{ .a_buf = a_buf[0..], .i_buf = i_buf[0..], .m_buf = m_buf[0..] };
-    const S = LayerBitsIterator(*TriCollector, 2, 2, .{ .active = 0, .inactive = 1, .mixed = 2 }, TriCollector.pushA, TriCollector.pushI, TriCollector.pushMt);
-    try std.testing.expect(S.runAll(&t, &tree));
-    // Only uniform-active regions reach on_active: L2 slot 0 = bits [0, 4096).
-    // Actives inside mixed slot 1 ([4096, 5000)) go to on_mixed as L2 id 1.
-    try std.testing.expectEqual(@as(usize, 4096), t.na);
+    var a_buf: [8]BitsSlice = undefined;
+    var i_buf: [8]BitsSlice = undefined;
+    var m_buf: [8]BitsSlice = undefined;
+    var d_buf: [8]BitsSlice = undefined;
+    var q = QuadCollector{ .a_buf = a_buf[0..], .i_buf = i_buf[0..], .m_buf = m_buf[0..], .d_buf = d_buf[0..] };
+    const L2 = LayerSlicesIterator(*QuadCollector, 2, QuadCollector.pushA, QuadCollector.pushI, QuadCollector.pushM, QuadCollector.pushD);
+    try std.testing.expect(L2.runAll(&q, &tree));
+    // L2 has ceil(20000/4096) = 5 ids: [0]=active, [1]=shallow mixed, [2..4]=inactive.
+    try std.testing.expectEqual(@as(usize, 1), q.na);
+    try std.testing.expectEqual(@as(usize, 1), q.nm);
+    try std.testing.expectEqual(@as(usize, 0), q.nd);
+    try std.testing.expectEqual(@as(usize, 1), q.ni);
+    try std.testing.expectEqual(BitsSlice{ .start = 0, .end = 1, .layer = 2 }, a_buf[0]);
+    try std.testing.expectEqual(BitsSlice{ .start = 1, .end = 2, .layer = 2 }, m_buf[0]);
+    try std.testing.expectEqual(BitsSlice{ .start = 2, .end = 5, .layer = 2 }, i_buf[0]);
+}
+
+test "slices: deep mixed external jump" {
+    const alloc = std.testing.allocator;
+    var tree = BitTree.empty;
+    defer tree.deinit(alloc);
+    try tree.resize(alloc, 8192, .inactive);
+    var b: u32 = 0;
+    while (b < 8192) : (b += 2) {
+        tree.setBit(b, true);
+    }
+    try std.testing.expectEqual(@as(u32, 4096), tree.count(.active));
+    // Every leaf word is fragmented, so the L2 word holds one deep run {0,2}.
+    // (Same-polarity runs merge within a word; only uniform runs coalesce across words.)
+    var a_buf: [8]BitsSlice = undefined;
+    var i_buf: [8]BitsSlice = undefined;
+    var m_buf: [8]BitsSlice = undefined;
+    var d_buf: [8]BitsSlice = undefined;
+    var q = QuadCollector{ .a_buf = a_buf[0..], .i_buf = i_buf[0..], .m_buf = m_buf[0..], .d_buf = d_buf[0..] };
+    const L2 = LayerSlicesIterator(*QuadCollector, 2, QuadCollector.pushA, QuadCollector.pushI, QuadCollector.pushM, QuadCollector.pushD);
+    try std.testing.expect(L2.runAll(&q, &tree));
+    try std.testing.expectEqual(@as(usize, 0), q.na);
+    try std.testing.expectEqual(@as(usize, 0), q.ni);
+    try std.testing.expectEqual(@as(usize, 0), q.nm);
+    try std.testing.expectEqual(@as(usize, 1), q.nd);
+    try std.testing.expectEqual(BitsSlice{ .start = 0, .end = 2, .layer = 2 }, d_buf[0]);
+    // External descent: the deep slice yields one deep run per L1 word, no L0 touch yet.
+    var l1_buf: [128]BitsSlice = undefined;
+    var l1 = SliceCollector{ .buf = l1_buf[0..] };
+    const L1d = LayerSlicesIterator(*SliceCollector, 1, null, null, null, SliceCollector.push);
+    try std.testing.expect(L1d.stepSlice(&l1, &tree, d_buf[0]));
+    try std.testing.expectEqual(@as(usize, 2), l1.n);
+    try std.testing.expectEqual(BitsSlice{ .start = 0, .end = 64, .layer = 1 }, l1.buf[0]);
+    try std.testing.expectEqual(BitsSlice{ .start = 64, .end = 128, .layer = 1 }, l1.buf[1]);
+    // Full external chain down to bits recovers exactly the even ids.
+    var buf: [4096]u32 = undefined;
+    var coll = IdCollector{ .buf = buf[0..] };
+    const bp = BitPush{ .coll = &coll };
+    const Leaf = LayerSlicesIterator(BitPush, 0, BitPush.active, null, null, null);
+    const L1 = LayerSlicesIterator(BitPush, 1, BitPush.active, null, Leaf.stepSlice, Leaf.stepSlice);
+    const L2c = LayerSlicesIterator(BitPush, 2, BitPush.active, null, L1.stepSlice, L1.stepSlice);
+    try std.testing.expect(L2c.runAll(bp, &tree));
+    try std.testing.expectEqual(@as(usize, 4096), coll.n);
     var k: usize = 0;
-    while (k < t.na) : (k += 1) {
-        try std.testing.expectEqual(@as(u32, @intCast(k)), t.a_buf[k]);
+    while (k < coll.n) : (k += 1) {
+        try std.testing.expectEqual(@as(u32, @intCast(2 * k)), coll.buf[k]);
     }
-    // L2 has ceil(20000/4096) = 5 ids: [0]=active, [1]=mixed, [2..4]=inactive.
-    try std.testing.expectEqual(@as(usize, 1), t.nm);
-    try std.testing.expectEqual(@as(u32, 1), t.m_buf[0]);
-    // L1 has ceil(20000/64) = 313 ids; uniform-inactive L2 slots are 2,3,4,
-    // i.e. L1 ids [128, 313). Inactive ids inside mixed L2 slot 1 are not
-    // visited by this stage at all (slot 1 goes to on_mixed as a whole).
-    try std.testing.expectEqual(@as(usize, 185), t.ni);
-    var j: usize = 0;
-    while (j < t.ni) : (j += 1) {
-        try std.testing.expectEqual(@as(u32, @intCast(128 + j)), t.i_buf[j]);
-    }
+}
+
+test "slices: early break stops walk" {
+    const alloc = std.testing.allocator;
+    var tree = BitTree.empty;
+    defer tree.deinit(alloc);
+    try tree.resize(alloc, 5000, .active);
+    // Dense L1 coalesces to exactly 2 slices: {0,64} and {64,79}.
+    var b1 = SliceBreakCtx{ .limit = 1 };
+    const L1 = LayerSlicesIterator(*SliceBreakCtx, 1, SliceBreakCtx.cb, null, null, null);
+    try std.testing.expect(!L1.runAll(&b1, &tree));
+    try std.testing.expectEqual(@as(usize, 1), b1.calls);
+    var b2 = SliceBreakCtx{ .limit = std.math.maxInt(usize) };
+    try std.testing.expect(L1.runAll(&b2, &tree));
+    try std.testing.expectEqual(@as(usize, 2), b2.calls);
+}
+
+test "slices: guards empty, shallow, out-of-range" {
+    const alloc = std.testing.allocator;
+    var tree = BitTree.empty;
+    defer tree.deinit(alloc);
+    var buf: [8]BitsSlice = undefined;
+    var coll = SliceCollector{ .buf = buf[0..] };
+    const L1 = LayerSlicesIterator(*SliceCollector, 1, SliceCollector.push, SliceCollector.push, SliceCollector.push, SliceCollector.push);
+    try std.testing.expect(L1.runAll(&coll, &tree));
+    try std.testing.expectEqual(@as(usize, 0), coll.n);
+    try tree.resize(alloc, 100, .inactive);
+    // scan_layer 5 does not exist in a depth-2 tree: silent no-op.
+    var coll2 = SliceCollector{ .buf = buf[0..] };
+    const Deep = LayerSlicesIterator(*SliceCollector, 5, SliceCollector.push, null, null, null);
+    try std.testing.expect(Deep.runAll(&coll2, &tree));
+    try std.testing.expectEqual(@as(usize, 0), coll2.n);
+    // Out-of-range, wrong-layer and empty slices are silent no-ops (L1 has 2 ids here).
+    var coll3 = SliceCollector{ .buf = buf[0..] };
+    try std.testing.expect(L1.stepSlice(&coll3, &tree, .{ .start = 99, .end = 100, .layer = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), coll3.n);
+    try std.testing.expect(L1.stepSlice(&coll3, &tree, .{ .start = 0, .end = 1, .layer = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), coll3.n);
+    try std.testing.expect(L1.stepSlice(&coll3, &tree, .{ .start = 1, .end = 1, .layer = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), coll3.n);
+    const Leaf = LayerSlicesIterator(*SliceCollector, 0, SliceCollector.push, null, null, null);
+    var coll4 = SliceCollector{ .buf = buf[0..] };
+    try std.testing.expect(Leaf.stepSlice(&coll4, &tree, .{ .start = 1000, .end = 1001, .layer = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), coll4.n);
 }
 
 test "early break stops walk" {
@@ -1710,12 +1896,12 @@ test "iterateTargetBits exact order" {
     try std.testing.expectEqual(@as(usize, 3002), coll.n);
     // Strictly ascending and exactly the naive active set.
     var k: usize = 0;
-    var b: u32 = 0;
-    while (b < 5000) : (b += 1) {
-        const want = (b >= 1000 and b < 4000) or b == 0 or b == 4999;
+    var bit: u32 = 0;
+    while (bit < 5000) : (bit += 1) {
+        const want = (bit >= 1000 and bit < 4000) or bit == 0 or bit == 4999;
         if (!want) continue;
         try std.testing.expect(k < coll.n);
-        try std.testing.expectEqual(b, coll.buf[k]);
+        try std.testing.expectEqual(bit, coll.buf[k]);
         k += 1;
     }
     try std.testing.expectEqual(coll.n, k);
@@ -1735,29 +1921,26 @@ test "iterateTargetBits exact order" {
     try std.testing.expectEqual(coll_i.n, k2);
 }
 
-test "guards: empty, shallow, out-of-range" {
+test "sumActiveIds matches naive sum" {
     const alloc = std.testing.allocator;
     var tree = BitTree.empty;
     defer tree.deinit(alloc);
-    var buf: [8]u32 = undefined;
-    var coll = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(tree.iterateTargetBits(*IdCollector, &coll, IdCollector.push, IdCollector.push));
-    try std.testing.expectEqual(@as(usize, 0), coll.n);
-    try tree.resize(alloc, 100, .inactive);
-    // scan_layer 5 does not exist in a depth-2 tree: silent no-op.
-    var coll2 = IdCollector{ .buf = buf[0..] };
-    const Deep2 = LayerBitsIterator(*IdCollector, 5, 5, .{ .active = 5, .inactive = 0, .mixed = 0 }, IdCollector.push, null, null);
-    try std.testing.expect(Deep2.runAll(&coll2, &tree));
-    try std.testing.expectEqual(@as(usize, 0), coll2.n);
-    // Out-of-range step id is a silent no-op (L1 has 2 ids here).
-    const L1 = LayerBitsIterator(*IdCollector, 1, 1, .{ .active = 1, .inactive = 1, .mixed = 1 }, IdCollector.push, IdCollector.push, null);
-    var coll3 = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(L1.step(&coll3, &tree, 99));
-    try std.testing.expectEqual(@as(usize, 0), coll3.n);
-    const Leaf = BitsetIterator(*IdCollector, 0, IdCollector.push, null);
-    var coll4 = IdCollector{ .buf = buf[0..] };
-    try std.testing.expect(Leaf.step(&coll4, &tree, 1000));
-    try std.testing.expectEqual(@as(usize, 0), coll4.n);
+    try tree.resize(alloc, 20000, .inactive);
+    tree.setRange(0, 5000, .active);
+    tree.setBit(19999, true);
+    const got = tree.sumActiveIds();
+    var want_sum: u64 = 0;
+    var want_count: u64 = 0;
+    var bit: u32 = 0;
+    while (bit < 20000) : (bit += 1) {
+        if (tree.getBit(bit)) {
+            want_sum += bit;
+            want_count += 1;
+        }
+    }
+    try std.testing.expectEqual(want_count, got.count);
+    try std.testing.expectEqual(want_sum, got.sum);
+    try std.testing.expectEqual(@as(u64, 5001), got.count);
 }
 
 test "fuzz target vs naive model" {
@@ -1824,12 +2007,12 @@ test "fuzz target vs naive model" {
             const n: usize = coll.n;
             try std.testing.expectEqual(@as(usize, c), n);
             var seen = [_]bool{false} ** 1024;
-            var k: usize = 0;
-            while (k < n) : (k += 1) {
-                try std.testing.expect(buf[k] < model_len);
-                try std.testing.expect(model[buf[k]]);
-                try std.testing.expect(!seen[buf[k]]);
-                seen[buf[k]] = true;
+            var s_k: usize = 0;
+            while (s_k < n) : (s_k += 1) {
+                try std.testing.expect(buf[s_k] < model_len);
+                try std.testing.expect(model[buf[s_k]]);
+                try std.testing.expect(!seen[buf[s_k]]);
+                seen[buf[s_k]] = true;
             }
             var j: u32 = 0;
             while (j < model_len) : (j += 1) {

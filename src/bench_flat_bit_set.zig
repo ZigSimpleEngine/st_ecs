@@ -1,5 +1,8 @@
-/// Speed comparison: previous linear word scan vs callback iterator chain.
-/// Mirrors the old bench scenarios so numbers are directly comparable.
+/// Speed comparison: flat linear word scan vs slice iterator chain.
+/// Tree leg `new` = slice-powered iterateTargetBits streaming ids straight
+/// into the summing callback (fair: same N per-bit adds as flat, hierarchy
+/// overhead only for slice discovery). Tree leg `arith` = sumActiveIds with
+/// O(slices) arithmetic, no per-bit loop (slice ceiling for dense data).
 /// Old baseline (ReleaseFast, same machine) for reference:
 ///   sparse1M(1004): linear 0.010ms tree-old 0.024ms | dense100k: linear 0.127 tree-old 0.051
 ///   every3rd200k: linear 0.104 tree-old 0.161 | ultra10M(100): linear 0.043 tree-old 0.004
@@ -106,6 +109,34 @@ fn benchTreeForEach(io: std.Io, tree: *const BitTree, comptime want: BitState, r
     return .{ .sum = sum, .count = count, .ns = watch.read() };
 }
 
+/// Ceiling leg: O(slices) arithmetic sum via sumActiveIds, no per-bit loop.
+/// Same total as the fair legs; measures slice discovery + formula cost only.
+fn benchTreeArith(io: std.Io, tree: *const BitTree, reps: u32) struct { sum: u64, count: u64, ns: u64 } {
+    var watch = Stopwatch.start(io);
+    var sum: u64 = 0;
+    var count: u64 = 0;
+    var r: u32 = 0;
+    while (r < reps) : (r += 1) {
+        const got = tree.sumActiveIds();
+        std.mem.doNotOptimizeAway(got);
+        sum += got.sum;
+        count += got.count;
+    }
+    return .{ .sum = sum, .count = count, .ns = watch.read() };
+}
+
+/// One active-scan scenario with an extra arith row (fair + ceiling side by side).
+fn benchArithPair(io: std.Io, alloc: Allocator, name: []const u8, tree: *const BitTree, flat: *const FlatBitSet, reps: u32) !void {
+    _ = alloc;
+    {
+        const got = tree.sumActiveIds();
+        std.mem.doNotOptimizeAway(got);
+    }
+    const fl = benchFlatSum(io, flat, .active, reps);
+    const tr = benchTreeArith(io, tree, reps);
+    std.debug.assert(fl.sum == tr.sum and fl.count == tr.count);
+    printRow(name, fl.count / reps, @as(f64, @floatFromInt(fl.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(tr.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0);
+}
 fn printHeader() void {
     std.debug.print("{s:<26} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "pattern", "elements", "flat(ms)", "new(ms)", "xFlat" });
     std.debug.print("{s:<26} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "--------------------------", "----------", "----------", "----------", "--------" });
@@ -183,6 +214,8 @@ fn benchClusterPair(io: std.Io, alloc: Allocator, bits_total: u32, run: u32, gap
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "cluster-r{d}-g{d}-N{d}", .{ run, gap, bits_total });
     try benchPair(io, alloc, name, &tree, &flat, .active, reps);
+    const aname = try std.fmt.bufPrint(&name_buf, "cluster-r{d}-g{d}-N{d}-arith", .{ run, gap, bits_total });
+    try benchArithPair(io, alloc, aname, &tree, &flat, reps);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -231,10 +264,14 @@ pub fn main(init: std.process.Init) !void {
 
     printHeader();
     try benchPair(io, alloc, "sparse1M", &sparse_tree, &sparse, .active, 500);
+    try benchArithPair(io, alloc, "sparse1M-arith", &sparse_tree, &sparse, 500);
     try benchPair(io, alloc, "sparse1M-inactive", &sparse_tree, &sparse, .inactive, 5);
     try benchPair(io, alloc, "dense100k", &dense_tree, &dense, .active, 20);
+    try benchArithPair(io, alloc, "dense100k-arith", &dense_tree, &dense, 20);
     try benchPair(io, alloc, "every3rd200k", &strided_tree, &strided, .active, 20);
+    try benchArithPair(io, alloc, "every3rd200k-arith", &strided_tree, &strided, 20);
     try benchPair(io, alloc, "ultra10M", &ultra_tree, &ultra, .active, 200);
+    try benchArithPair(io, alloc, "ultra10M-arith", &ultra_tree, &ultra, 200);
 
     const strides = [_]u32{ 1, 2, 4, 8, 16, 64, 256, 1024, 4096, 16384, 65536 };
     for ([_]u32{1_000_000}) |total| {
