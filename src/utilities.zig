@@ -7,3 +7,40 @@ pub const List = std.ArrayList;
 pub fn ListA64(comptime T: type) type {
     return std.array_list.Aligned(T, std.mem.Alignment.@"64");
 }
+
+pub fn assertUnsignedPowerOfTwoInt(comptime T: type) void {
+    const info = @typeInfo(T);
+
+    switch (info) {
+        .int => |int_info| {
+            if (int_info.signedness != .unsigned) {
+                @compileError("expected an unsigned integer type");
+            }
+
+            const bits = int_info.bits;
+
+            if (bits < 2 or (bits & (bits - 1)) != 0) {
+                @compileError("unsigned integer bit size must be a power of two >= 2");
+            }
+        },
+        else => @compileError("expected an unsigned integer type"),
+    }
+}
+
+pub const BitState = enum(u1) {
+    const Self = @This();
+
+    inactive = 0,
+    active = 1,
+
+    pub inline fn toWordState(self: Self, comptime Word: type) Word {
+        comptime {
+            assertUnsignedPowerOfTwoInt(Word);
+        }
+        return 0 -% @as(Word, @intFromEnum(self));
+    }
+
+    pub inline fn asBool(self: Self) bool {
+        return self == .active;
+    }
+};
