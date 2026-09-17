@@ -13,6 +13,7 @@
 /// zig build bench -Doptimize=ReleaseFast
 const std = @import("std");
 const bit_tree = @import("bit_tree.zig");
+const p9 = @import("iteration_tests/p9.zig");
 
 const Allocator = std.mem.Allocator;
 const FlatBitSet = bit_tree.FlatBitSet;
@@ -78,6 +79,46 @@ fn benchFlatSum(io: std.Io, flat: *const FlatBitSet, want: BitState, reps: u32) 
     return .{ .sum = sum, .count = count, .ns = watch.read() };
 }
 
+/// P9 leg: ctz-peeling straight into the summing callback, one call per
+/// TARGET bit only (opposite bits never visited). Same N per-bit adds as
+/// flat/new (sum += id, id data-dependent => no folding), dispatch differs.
+/// Word base travels via global (bench-only, single-threaded).
+var p9_base: u64 = 0;
+var p9_sum: u64 = 0;
+var p9_count: u64 = 0;
+
+fn p9Add(bit: u6) void {
+    p9_sum += p9_base + bit;
+    p9_count += 1;
+}
+
+fn benchP9Sum(io: std.Io, flat: *const FlatBitSet, want: BitState, reps: u32) struct { sum: u64, count: u64, ns: u64 } {
+    var watch = Stopwatch.start(io);
+    var sum: u64 = 0;
+    var count: u64 = 0;
+    var r: u32 = 0;
+    while (r < reps) : (r += 1) {
+        p9_sum = 0;
+        p9_count = 0;
+        const words = flat.words.items;
+        var w: usize = 0;
+        while (w < words.len) : (w += 1) {
+            var bits: u64 = words[w];
+            if (want == .inactive) bits = ~bits;
+            if (w + 1 == words.len and (flat.total_bits & 63) != 0) {
+                const rem: u6 = @intCast(flat.total_bits & 63);
+                bits &= (@as(u64, 1) << rem) - 1;
+            }
+            p9_base = @as(u64, w) * 64;
+            // Активные нужной стороны после инверсии — всегда set-биты.
+            p9.iterateActiveWord(bits, p9Add);
+        }
+        sum += p9_sum;
+        count += p9_count;
+    }
+    return .{ .sum = sum, .count = count, .ns = watch.read() };
+}
+
 /// Summing callback context for the tree leg: work happens inside the walk.
 const SumCtx = struct {
     sum: u64 = 0,
@@ -135,16 +176,16 @@ fn benchArithPair(io: std.Io, alloc: Allocator, name: []const u8, tree: *const B
     const fl = benchFlatSum(io, flat, .active, reps);
     const tr = benchTreeArith(io, tree, reps);
     std.debug.assert(fl.sum == tr.sum and fl.count == tr.count);
-    printRow(name, fl.count / reps, @as(f64, @floatFromInt(fl.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(tr.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0);
+    printRow(name, fl.count / reps, @as(f64, @floatFromInt(fl.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(tr.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, std.math.nan(f64));
 }
 fn printHeader() void {
-    std.debug.print("{s:<26} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "pattern", "elements", "flat(ms)", "new(ms)", "xFlat" });
-    std.debug.print("{s:<26} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "--------------------------", "----------", "----------", "----------", "--------" });
+    std.debug.print("{s:<26} {s:>10} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "pattern", "elements", "flat(ms)", "new(ms)", "p9(ms)", "xFlat" });
+    std.debug.print("{s:<26} {s:>10} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "--------------------------", "----------", "----------", "----------", "----------", "--------" });
 }
 
-fn printRow(name: []const u8, elements: u64, ms_flat: f64, ms_new: f64) void {
+fn printRow(name: []const u8, elements: u64, ms_flat: f64, ms_new: f64, ms_p9: f64) void {
     const x: f64 = if (ms_new > 0) ms_flat / ms_new else 0;
-    std.debug.print("{s:<26} {d:>10} {d:>10.3} {d:>10.3} {d:>7.2}x\n", .{ name, elements, ms_flat, ms_new, x });
+    std.debug.print("{s:<26} {d:>10} {d:>10.3} {d:>10.3} {d:>10.3} {d:>7.2}x\n", .{ name, elements, ms_flat, ms_new, ms_p9, x });
 }
 
 /// One scenario on identical flat/tree contents. No output arrays anywhere.
@@ -161,8 +202,10 @@ fn benchPair(io: std.Io, alloc: Allocator, name: []const u8, tree: *const BitTre
     }
     const fl = benchFlatSum(io, flat, want, reps);
     const tr = benchTreeForEach(io, tree, want, reps);
+    const p9r = benchP9Sum(io, flat, want, reps);
     std.debug.assert(fl.sum == tr.sum and fl.count == tr.count);
-    printRow(name, fl.count / reps, @as(f64, @floatFromInt(fl.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(tr.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0);
+    std.debug.assert(fl.sum == p9r.sum and fl.count == p9r.count);
+    printRow(name, fl.count / reps, @as(f64, @floatFromInt(fl.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(tr.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(p9r.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0);
 }
 
 fn benchThresholdPair(io: std.Io, alloc: Allocator, bits_total: u32, stride: u32, reps: u32) !void {
@@ -203,7 +246,8 @@ fn benchFill(io: std.Io, alloc: Allocator, bits_total: u32, stride: u32, offset:
     std.debug.print("{s:<26} {d:>10} {d:>10.3} {s:>10} {d:>7.1}ns/set\n", .{ name, check / reps, ns / 1_000_000.0, "---", per_set });
 }
 
-fn benchClusterPair(io: std.Io, alloc: Allocator, bits_total: u32, run: u32, gap: u32, reps: u32) !void {    var tree = BitTree.empty;
+fn benchClusterPair(io: std.Io, alloc: Allocator, bits_total: u32, run: u32, gap: u32, reps: u32) !void {
+    var tree = BitTree.empty;
     defer tree.deinit(alloc);
     var flat = FlatBitSet.empty;
     defer flat.deinit(alloc);

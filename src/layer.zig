@@ -5,6 +5,7 @@ const bit_word = @import("bit_word.zig");
 const Allocator = std.mem.Allocator;
 const ListA64 = utilities.ListA64;
 
+const iterateWord = utilities.iterateActiveBitsInWord;
 const BitState = utilities.BitState;
 
 pub fn Layer(comptime Word: type) type {
@@ -57,7 +58,90 @@ pub fn Layer(comptime Word: type) type {
 
         pub const StateCounts = struct { inactive: u32, active: u32, mixed: u32, deep: u32 };
 
-        /// Counts the 4 (activity, mixed) states restricted to `mask`.
+        pub fn Iterator(
+            comptime Context: type,
+            comptime on_inactive: ?fn (context: Context, bit_id: u32) bool,
+            comptime on_active: ?fn (context: Context, bit_id: u32) bool,
+            comptime on_mixed: ?fn (context: Context, bit_id: u32) bool,
+            comptime on_deep_mixed: ?fn (context: Context, bit_id: u32) bool,
+        ) type {
+            return struct {
+                pub const LayerWithContext = struct {
+                    layer: *Self,
+                    context: Context,
+                };
+
+                pub inline fn step(data: LayerWithContext, word_id: u32) bool {
+                    const layer = data.layer;
+                    const context = data.context;
+                    std.debug.assert(word_id < layer.activity.items.len);
+                    std.debug.assert(layer.activity.items.len == layer.mixed.items.len);
+                    const activity_words = layer.activity.items;
+                    const activity_word = activity_words[word_id];
+                    const mixed_word = layer.mixed.items[word_id];
+                    const inv_activity_word = ~activity_word;
+                    const inv_mixed_word = ~mixed_word;
+                    const start = bw.wordToBitId(word_id);
+
+                    var mask: Word = bw.max_value;
+                    if (word_id == activity_words.len - 1) {
+                        const used = bw.bitIdInWord(layer.bits_count);
+                        if (used != 0) mask = bw.maskStart(used);
+                    }
+
+                    if (on_inactive) |f| {
+                        const only_inactive_word = inv_activity_word & inv_mixed_word & mask;
+                        if (!iterateWord(
+                            Word,
+                            Context,
+                            f,
+                            context,
+                            start,
+                            only_inactive_word,
+                        )) return false;
+                    }
+
+                    if (on_active) |f| {
+                        const only_active_word = activity_word & inv_mixed_word & mask;
+                        if (!iterateWord(
+                            Word,
+                            Context,
+                            f,
+                            context,
+                            start,
+                            only_active_word,
+                        )) return false;
+                    }
+
+                    if (on_mixed) |f| {
+                        const only_mixed_word = inv_activity_word & mixed_word & mask;
+                        if (!iterateWord(
+                            Word,
+                            Context,
+                            f,
+                            context,
+                            start,
+                            only_mixed_word,
+                        )) return false;
+                    }
+
+                    if (on_deep_mixed) |f| {
+                        const only_deep_mixed = activity_word & mixed_word & mask;
+                        if (!iterateWord(
+                            Word,
+                            Context,
+                            f,
+                            context,
+                            start,
+                            only_deep_mixed,
+                        )) return false;
+                    }
+
+                    return true;
+                }
+            };
+        }
+
         inline fn countStates(activity: Word, mixed: Word, mask: Word) StateCounts {
             const a = activity & mask;
             const m = mixed & mask;
@@ -79,8 +163,7 @@ pub fn Layer(comptime Word: type) type {
             std.debug.assert(id < self.activity.items.len);
             std.debug.assert(self.activity.items.len == self.mixed.items.len);
             var eff: Word = mask;
-            // Ignore padding beyond bits_count in the last word: never write
-            // it and never count it.
+
             const words_count = self.activity.items.len;
             if (words_count > 0 and id == words_count - 1) {
                 const used: u32 = bw.bitIdInWord(self.bits_count);
@@ -212,8 +295,6 @@ pub fn Layer(comptime Word: type) type {
     };
 }
 
-pub const BitTree = struct {};
-
 const t = std.testing;
 
 fn scanCounters(comptime Word: type, layer: *const Layer(Word)) [4]u32 {
@@ -223,8 +304,8 @@ fn scanCounters(comptime Word: type, layer: *const Layer(Word)) [4]u32 {
     while (i < layer.bits_count) : (i += 1) {
         const bit_word_id = BW.bitToWordId(i);
         const bit_id_in_word = BW.bitIdInWord(i);
-        const a = BW.readBit(layer.activity.items[bit_word_id], @truncate(bit_id_in_word));
-        const m = BW.readBit(layer.mixed.items[bit_word_id], @truncate(bit_id_in_word));
+        const a = BW.readBitState(layer.activity.items[bit_word_id], @truncate(bit_id_in_word));
+        const m = BW.readBitState(layer.mixed.items[bit_word_id], @truncate(bit_id_in_word));
         out[@intFromEnum(Layer(Word).State.fromBits(a, m))] += 1;
     }
     return out;
@@ -268,15 +349,13 @@ test "Layer.State int constants match enum values" {
 
 test "Layer(u8) countStates" {
     const L8 = Layer(u8);
-    // a=0b1010, m=0b1100, full mask: b0=inactive, b1=active, b2=mixed,
-    // b3=deep, upper zero bits b4..b7=inactive.
+
     const c = L8.countStates(0b1010, 0b1100, 0xFF);
     try t.expectEqual(@as(u32, 5), c.inactive);
     try t.expectEqual(@as(u32, 1), c.active);
     try t.expectEqual(@as(u32, 1), c.mixed);
     try t.expectEqual(@as(u32, 1), c.deep);
 
-    // Restricted mask: only low 2 bits (b0=inactive, b1=active).
     const c2 = L8.countStates(0b1010, 0b1100, 0x03);
     try t.expectEqual(@as(u32, 1), c2.inactive);
     try t.expectEqual(@as(u32, 1), c2.active);
@@ -373,7 +452,6 @@ test "Layer(u64) setWord: masked insert + counters" {
     try layer.resize(t.allocator, 128, .inactive);
     try t.expectEqual([4]u32{ 128, 0, 0, 0 }, layer.state_counters);
 
-    // Full-word insert: low 64 bits -> 32 active + 32 mixed.
     var act: u64 = 0;
     var mix: u64 = 0;
     for (0..32) |i| act |= @as(u64, 1) << @intCast(i);
@@ -382,21 +460,17 @@ test "Layer(u64) setWord: masked insert + counters" {
     try t.expectEqual([4]u32{ 64, 32, 32, 0 }, layer.state_counters);
     try expectLayerValid(u64, &layer);
 
-    // Partial mask: flip bits [0,4) to deep_mixed.
     layer.setWord(0, std.math.maxInt(u64), std.math.maxInt(u64), 0xF);
     try t.expectEqual([4]u32{ 64, 28, 32, 4 }, layer.state_counters);
     try expectLayerValid(u64, &layer);
 
-    // Empty mask is a no-op.
     layer.setWord(0, 0, 0, 0);
     try t.expectEqual([4]u32{ 64, 28, 32, 4 }, layer.state_counters);
 
-    // Same-value insert is a no-op for counters.
     layer.setWord(0, act | 0xF, mix | 0xF, std.math.maxInt(u64));
     try t.expectEqual([4]u32{ 64, 28, 32, 4 }, layer.state_counters);
     try expectLayerValid(u64, &layer);
 
-    // Second word: single-bit insert via mask.
     layer.setWord(1, std.math.maxInt(u64), 0, 0x1);
     try t.expectEqual([4]u32{ 63, 29, 32, 4 }, layer.state_counters);
     try expectLayerValid(u64, &layer);
@@ -406,11 +480,205 @@ test "Layer(u64) setWord: padding bits ignored" {
     const L64 = Layer(u64);
     var layer: L64 = .{};
     defer layer.deinit(t.allocator);
-    try layer.resize(t.allocator, 70, .inactive); // last word has 6 valid bits
+    try layer.resize(t.allocator, 70, .inactive);
     layer.setWord(1, std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u64));
-    // Only 6 valid bits counted as deep, padding stays zero.
+
     try t.expectEqual([4]u32{ 64, 0, 0, 6 }, layer.state_counters);
     try expectLayerValid(u64, &layer);
     try t.expectEqual(@as(u64, 0x3F), layer.activity.items[1]);
     try t.expectEqual(@as(u64, 0x3F), layer.mixed.items[1]);
+}
+
+const StepStates = struct {
+    inactive: [256]u32 = undefined,
+    ni: usize = 0,
+    active: [256]u32 = undefined,
+    na: usize = 0,
+    mixed: [256]u32 = undefined,
+    nm: usize = 0,
+    deep: [256]u32 = undefined,
+    nd: usize = 0,
+    stop_after: u32 = std.math.maxInt(u32),
+
+    fn total(self: *const StepStates) usize {
+        return self.ni + self.na + self.nm + self.nd;
+    }
+};
+
+fn stepPushI(ctx: *StepStates, bit_id: u32) bool {
+    ctx.inactive[ctx.ni] = bit_id;
+    ctx.ni += 1;
+    return ctx.total() < ctx.stop_after;
+}
+
+fn stepPushA(ctx: *StepStates, bit_id: u32) bool {
+    ctx.active[ctx.na] = bit_id;
+    ctx.na += 1;
+    return ctx.total() < ctx.stop_after;
+}
+
+fn stepPushM(ctx: *StepStates, bit_id: u32) bool {
+    ctx.mixed[ctx.nm] = bit_id;
+    ctx.nm += 1;
+    return ctx.total() < ctx.stop_after;
+}
+
+fn stepPushD(ctx: *StepStates, bit_id: u32) bool {
+    ctx.deep[ctx.nd] = bit_id;
+    ctx.nd += 1;
+    return ctx.total() < ctx.stop_after;
+}
+
+fn stepCollectAll(comptime Word: type, layer: *Layer(Word), ctx: *StepStates) bool {
+    const It = Layer(Word).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+    var wid: u32 = 0;
+    while (wid < layer.activity.items.len) : (wid += 1) {
+        if (!It.step(.{ .layer = layer, .context = ctx }, wid)) return false;
+    }
+    return true;
+}
+
+fn stepOracleStates(comptime Word: type, layer: *const Layer(Word), out: *[4][256]u32) [4]usize {
+    const BW = bit_word.BitWord(Word);
+    var ns = [4]usize{ 0, 0, 0, 0 };
+    var i: u32 = 0;
+    while (i < layer.bits_count) : (i += 1) {
+        const wid: usize = @intCast(BW.bitToWordId(i));
+        const in_w = BW.bitIdInWord(i);
+        const a = BW.readBitState(layer.activity.items[wid], in_w);
+        const m = BW.readBitState(layer.mixed.items[wid], in_w);
+        const s: usize = @intFromEnum(Layer(Word).State.fromBits(a, m));
+        out[s][ns[s]] = i;
+        ns[s] += 1;
+    }
+    return ns;
+}
+
+const StepPattern = enum { all_inactive, all_active, all_mixed, all_deep, cycle4, sparse_deep, pseudo };
+
+fn patternState(pat: StepPattern, i: u32) Layer(u64).State {
+    return switch (pat) {
+        .all_inactive => .inactive,
+        .all_active => .active,
+        .all_mixed => .mixed,
+        .all_deep => .deep_mixed,
+        .cycle4 => @enumFromInt(@as(u2, @truncate(i))),
+        .sparse_deep => if (i == 0 or i % 63 == 0) .deep_mixed else .inactive,
+        .pseudo => @enumFromInt(@as(u2, @truncate((i *% 2654435761) >> 29))),
+    };
+}
+
+fn layerSetState(comptime Word: type, layer: *Layer(Word), i: u32, st: Layer(Word).State) void {
+    const BW = bit_word.BitWord(Word);
+    const wid = BW.bitToWordId(i);
+    const in_w = BW.bitIdInWord(i);
+    const m: Word = @as(Word, 1) << in_w;
+    const a: Word = if (st.activityBit() == .active) m else 0;
+    const mm: Word = if (st.mixedBit() == .active) m else 0;
+    layer.setWord(wid, a, mm, m);
+}
+
+fn stepCheckOne(comptime Word: type, n: u32, pat: StepPattern) !void {
+    const BW = bit_word.BitWord(Word);
+    const L = Layer(Word);
+    var layer: L = .{};
+    defer layer.deinit(t.allocator);
+    try layer.resize(t.allocator, n, .inactive);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const st64 = patternState(pat, i);
+        layerSetState(Word, &layer, i, @enumFromInt(@intFromEnum(st64)));
+    }
+    try expectLayerValid(Word, &layer);
+
+    if (n > 0) {
+        const used = BW.bitIdInWord(n);
+        if (used != 0) {
+            const valid = BW.maskStart(used);
+            const last = layer.activity.items.len - 1;
+            layer.activity.items[last] |= ~valid;
+            layer.mixed.items[last] |= ~valid;
+        }
+    }
+
+    var ctx = StepStates{};
+    try t.expect(stepCollectAll(Word, &layer, &ctx));
+
+    var exp: [4][256]u32 = undefined;
+    const ns = stepOracleStates(Word, &layer, &exp);
+    const got = [_][]const u32{
+        ctx.inactive[0..ctx.ni],
+        ctx.active[0..ctx.na],
+        ctx.mixed[0..ctx.nm],
+        ctx.deep[0..ctx.nd],
+    };
+
+    for (0..4) |s| {
+        try t.expectEqualSlices(u32, exp[s][0..ns[s]], got[s]);
+    }
+
+    try t.expectEqual(n, @as(u32, @intCast(ctx.ni + ctx.na + ctx.nm + ctx.nd)));
+}
+
+test "Layer step: 4 states counts + corners" {
+    const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 70, 127, 128, 129, 200 };
+    const patterns = [_]StepPattern{ .all_inactive, .all_active, .all_mixed, .all_deep, .cycle4, .sparse_deep, .pseudo };
+    for (sizes) |n| {
+        for (patterns) |pat| {
+            try stepCheckOne(u64, n, pat);
+            try stepCheckOne(u8, n, pat);
+        }
+    }
+}
+
+test "Layer step: early exit stops the walk" {
+    {
+        var layer: Layer(u64) = .{};
+        defer layer.deinit(t.allocator);
+        try layer.resize(t.allocator, 70, .inactive);
+        const It = Layer(u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        var ctx = StepStates{ .stop_after = 3 };
+        try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 3), ctx.ni);
+        try t.expectEqual(@as(usize, 0), ctx.na + ctx.nm + ctx.nd);
+        try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ctx.inactive[0..ctx.ni]);
+    }
+
+    {
+        var layer: Layer(u64) = .{};
+        defer layer.deinit(t.allocator);
+        try layer.resize(t.allocator, 10, .inactive);
+        layerSetState(u64, &layer, 0, .active);
+        layerSetState(u64, &layer, 9, .active);
+        const It = Layer(u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        var ctx = StepStates{ .stop_after = 10 };
+
+        try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 8), ctx.ni);
+        try t.expectEqualSlices(u32, &[_]u32{ 0, 9 }, ctx.active[0..ctx.na]);
+    }
+
+    {
+        var layer: Layer(u64) = .{};
+        defer layer.deinit(t.allocator);
+        try layer.resize(t.allocator, 130, .deep_mixed);
+        const It = Layer(u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        var ctx = StepStates{ .stop_after = 70 };
+        try t.expect(It.step(.{ .layer = &layer, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 64), ctx.nd);
+        try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 1));
+        try t.expectEqual(@as(usize, 70), ctx.nd);
+        try t.expectEqual(@as(u32, 64), ctx.deep[64]);
+        try t.expectEqual(@as(u32, 69), ctx.deep[69]);
+    }
+
+    {
+        var layer: Layer(u64) = .{};
+        defer layer.deinit(t.allocator);
+        try layer.resize(t.allocator, 10, .mixed);
+        const It = Layer(u64).Iterator(*StepStates, stepPushI, stepPushA, stepPushM, stepPushD);
+        var ctx = StepStates{ .stop_after = 1 };
+        try t.expect(!It.step(.{ .layer = &layer, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 1), ctx.ni + ctx.na + ctx.nm + ctx.nd);
+    }
 }

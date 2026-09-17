@@ -1,0 +1,52 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "zig: ensure test debug dir",
+      "type": "shell",
+      "command": "New-Item -ItemType Directory -Force -Path \"${workspaceFolder}/zig-out/debug\" | Out-Null",
+      "presentation": {
+        "echo": false,
+        "reveal": "silent",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": false,
+        "clear": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "zig: build active file test",
+      "type": "process",
+      "command": "zig",
+      "args": [
+        "test",
+        "--test-no-exec",
+        "-O",
+        "Debug",
+        "-femit-bin=${workspaceFolder}/zig-out/debug/${fileBasenameNoExtension}_test.exe",
+        "${file}"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": [
+        "zig: ensure test debug dir"
+      ],
+      "dependsOrder": "sequence",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "silent",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": false,
+        "clear": false
+      },
+      "problemMatcher": "$gcc"
+    }
+  ]
+}

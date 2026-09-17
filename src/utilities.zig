@@ -27,6 +27,29 @@ pub fn assertUnsignedPowerOfTwoInt(comptime T: type) void {
     }
 }
 
+pub inline fn iterateActiveBitsInWord(
+    comptime Word: type,
+    comptime Context: type,
+    comptime callback: fn (context: Context, bit_id: u32) bool,
+    context: Context,
+    start_bit_id: u32,
+    word: Word,
+) bool {
+    comptime {
+        assertUnsignedPowerOfTwoInt(Word);
+    }
+
+    var w = word;
+    while (w != 0) {
+        const i: u32 = @ctz(w);
+        if (!callback(context, start_bit_id + i)) return false;
+        w &= w - 1;
+    }
+    return true;
+}
+
+pub const BitRange = struct { start: u32, len: u32, layer: u32 };
+
 pub const BitState = enum(u1) {
     const Self = @This();
 

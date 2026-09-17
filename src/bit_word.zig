@@ -57,20 +57,43 @@ pub fn BitWord(comptime Word: type) type {
             return maskStart(start_bits) | maskEnd(end_bits);
         }
 
+        /// start zone = 0 (low bits_count bits), remaining = 1
+        pub inline fn maskStartInverted(bits_count: Shift) Word {
+            return max_value << bits_count;
+        }
+
+        /// end zone = 0 (high bits_count bits), remaining = 1
+        pub inline fn maskEndInverted(bits_count: Shift) Word {
+            return max_value >> bits_count;
+        }
+
+        /// start = 0, center = 1, end = 0
+        pub inline fn maskStartEndInverted(start_bits: Shift, end_bits: Shift) Word {
+            return maskStart(start_bits) & maskEnd(end_bits);
+        }
+
+        pub inline fn maskStartInvertedClamped(count: u32) Word {
+            return if (count >= word_type_bits) 0 else maskStartInverted(@truncate(count));
+        }
+
+        pub inline fn maskEndInvertedClamped(count: u32) Word {
+            return if (count >= word_type_bits) 0 else maskEndInverted(@truncate(count));
+        }
+
+        pub inline fn maskStartEndInvertedClamped(start_count: u32, end_count: u32) Word {
+            return maskStartInvertedClamped(start_count) | maskEndInvertedClamped(end_count);
+        }
+
         /// Mask with the low `count` bits set: 0 -> 0, >= word_bits -> all ones.
         /// Saturating `maskStart` generalized from `Shift` to full `u32` range.
         pub inline fn maskStartClamped(count: u32) Word {
-            if (count == 0) return 0;
-            if (count >= word_type_bits) return max_value;
-            return maskStart(@truncate(count));
+            return if (count >= word_type_bits) max_value else maskStart(@truncate(count));
         }
 
         /// Mask with the high `count` bits set: 0 -> 0, >= word_bits -> all ones.
         /// Saturating `maskEnd` generalized from `Shift` to full `u32` range.
         pub inline fn maskEndClamped(count: u32) Word {
-            if (count == 0) return 0;
-            if (count >= word_type_bits) return max_value;
-            return maskEnd(@truncate(count));
+            return if (count >= word_type_bits) max_value else maskEnd(@truncate(count));
         }
 
         /// start = 1, center = 0, end = 1 with `u32` counts.
@@ -84,8 +107,12 @@ pub fn BitWord(comptime Word: type) type {
             return zero ^ ((zero ^ one) & mask);
         }
 
-        pub inline fn readBit(word: Word, bit_id_in_word: Shift) BitState {
+        pub inline fn readBitState(word: Word, bit_id_in_word: Shift) BitState {
             return @enumFromInt(@as(u1, @truncate(word >> bit_id_in_word)));
+        }
+
+        pub inline fn readBit(word: Word, bit_id_in_word: Shift) u1 {
+            return @truncate(word >> bit_id_in_word);
         }
     };
 }
@@ -174,14 +201,16 @@ test "masks and merges" {
     try t.expectEqual(18_446_744_073_709_551_614, BitWord(u64).maskEnd(63));
 
     const target_byte: u8 = 0b1000_1010;
-    try t.expectEqual(BitState.inactive, BitWord8.readBit(target_byte, 0));
-    try t.expectEqual(BitState.active, BitWord8.readBit(target_byte, 1));
-    try t.expectEqual(BitState.inactive, BitWord8.readBit(target_byte, 2));
-    try t.expectEqual(BitState.active, BitWord8.readBit(target_byte, 3));
-    try t.expectEqual(BitState.inactive, BitWord8.readBit(target_byte, 4));
-    try t.expectEqual(BitState.inactive, BitWord8.readBit(target_byte, 5));
-    try t.expectEqual(BitState.inactive, BitWord8.readBit(target_byte, 6));
-    try t.expectEqual(BitState.active, BitWord8.readBit(target_byte, 7));
+    try t.expectEqual(BitState.inactive, BitWord8.readBitState(target_byte, 0));
+    try t.expectEqual(0, BitWord8.readBit(target_byte, 0));
+    try t.expectEqual(BitState.active, BitWord8.readBitState(target_byte, 1));
+    try t.expectEqual(1, BitWord8.readBit(target_byte, 1));
+    try t.expectEqual(BitState.inactive, BitWord8.readBitState(target_byte, 2));
+    try t.expectEqual(BitState.active, BitWord8.readBitState(target_byte, 3));
+    try t.expectEqual(BitState.inactive, BitWord8.readBitState(target_byte, 4));
+    try t.expectEqual(BitState.inactive, BitWord8.readBitState(target_byte, 5));
+    try t.expectEqual(BitState.inactive, BitWord8.readBitState(target_byte, 6));
+    try t.expectEqual(BitState.active, BitWord8.readBitState(target_byte, 7));
 
     const merge_0 = [_]u8{ 0b1010_1010, 0b1111_0000, 0b1111_0000, 0b1010_1010, 0b1010_1010, 0b0000_0000 };
     const merge_1 = [_]u8{ 0b0101_0101, 0b0000_1111, 0b0000_1111, 0b0101_0101, 0b0101_0101, 0b1111_1111 };

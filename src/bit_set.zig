@@ -4,6 +4,8 @@ const bit_word = @import("bit_word.zig");
 const Allocator = std.mem.Allocator;
 const ListA64 = utilities.ListA64;
 
+const iterateActiveBitsInWord = utilities.iterateActiveBitsInWord;
+const BitRange = utilities.BitRange;
 const BitState = utilities.BitState;
 
 pub fn BitSet(comptime Word: type) type {
@@ -19,6 +21,59 @@ pub fn BitSet(comptime Word: type) type {
         words: ListA64(Word) = .empty,
         bits_count: u32 = 0,
         active_bits_counter: u32 = 0,
+
+        pub fn Iterator(
+            comptime Context: type,
+            comptime on_active: ?fn (context: Context, bit_id: u32) bool,
+            comptime on_inactive: ?fn (context: Context, bit_id: u32) bool,
+        ) type {
+            return struct {
+                pub const BitsetWithContext = struct {
+                    bitset: *Self,
+                    context: Context,
+                };
+
+                pub inline fn step(data: BitsetWithContext, word_id: u32) bool {
+                    const bitset = data.bitset;
+                    const context = data.context;
+                    std.debug.assert(word_id < bitset.words.items.len);
+
+                    const words = bitset.words.items;
+                    const start = bw.wordToBitId(word_id);
+                    const word = words[word_id];
+
+                    var mask: Word = bw.max_value;
+                    if (word_id == words.len - 1) {
+                        const used = bw.bitIdInWord(bitset.bits_count);
+                        if (used != 0) mask = bw.maskStart(used);
+                    }
+
+                    if (on_active) |f| {
+                        if (!iterateActiveBitsInWord(
+                            Word,
+                            Context,
+                            f,
+                            context,
+                            start,
+                            word & mask,
+                        )) return false;
+                    }
+
+                    if (on_inactive) |f| {
+                        if (!iterateActiveBitsInWord(
+                            Word,
+                            Context,
+                            f,
+                            context,
+                            start,
+                            (~word) & mask,
+                        )) return false;
+                    }
+
+                    return true;
+                }
+            };
+        }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
             self.words.deinit(allocator);
@@ -48,7 +103,7 @@ pub fn BitSet(comptime Word: type) type {
             const word_id = bw.bitToWordId(id);
             const bit_id_in_word = bw.bitIdInWord(id);
             const old_word: Word = self.words.items[word_id];
-            const old_value = bw.readBit(old_word, bit_id_in_word);
+            const old_value = bw.readBitState(old_word, bit_id_in_word);
             if (old_value == value) return;
             if (value == .active) {
                 self.words.items[word_id] = old_word | (@as(Word, 1) << bit_id_in_word);
@@ -143,7 +198,7 @@ fn bitSetScanActiveCount(comptime Word: type, bs: *const BitSet(Word)) u32 {
     while (i < bs.bits_count) : (i += 1) {
         const wid: usize = @intCast(BW.bitToWordId(i));
         const bid = BW.bitIdInWord(i);
-        if (BW.readBit(bs.words.items[wid], bid) == .active) acc += 1;
+        if (BW.readBitState(bs.words.items[wid], bid) == .active) acc += 1;
     }
     return acc;
 }
@@ -229,7 +284,7 @@ fn checkOneResize(comptime Word: type, allocator: Allocator, old: u32, new: u32,
         const want: BitState = if (j < old) patternBit(pat, j) else created;
         const wid: usize = @intCast(BW.bitToWordId(j));
         const bid = BW.bitIdInWord(j);
-        const got = BW.readBit(bs.words.items[wid], bid);
+        const got = BW.readBitState(bs.words.items[wid], bid);
         try t.expectEqual(want, got);
     }
     try expectBitSetInvariants(Word, &bs);
@@ -497,7 +552,7 @@ test "BitSet(u64) resize sequential fuzz vs oracle" {
             const i: u32 = @intCast(idx);
             const want: BitState = @enumFromInt(expected[idx]);
             const wid: usize = @intCast(BW.bitToWordId(i));
-            const got = BW.readBit(bs.words.items[wid], BW.bitIdInWord(i));
+            const got = BW.readBitState(bs.words.items[wid], BW.bitIdInWord(i));
             try t.expectEqual(want, got);
         }
         try expectBitSetInvariants(u64, &bs);
@@ -538,7 +593,7 @@ test "BitSet(u8) resize sequential fuzz vs oracle" {
             const i: u32 = @intCast(idx);
             const want: BitState = @enumFromInt(expected[idx]);
             const wid: usize = @intCast(BW.bitToWordId(i));
-            const got = BW.readBit(bs.words.items[wid], BW.bitIdInWord(i));
+            const got = BW.readBitState(bs.words.items[wid], BW.bitIdInWord(i));
             try t.expectEqual(want, got);
         }
         try expectBitSetInvariants(u8, &bs);
@@ -637,4 +692,169 @@ test "BitSet(u64) setBit: flip + counters" {
     bs.setBit(0, .inactive);
     try t.expectEqual(@as(u32, 0), bs.active_bits_counter);
     try expectBitSetInvariants(u64, &bs);
+}
+
+const StepIds = struct {
+    active: [256]u32 = undefined,
+    na: usize = 0,
+    inactive: [256]u32 = undefined,
+    ni: usize = 0,
+    stop_after: u32 = std.math.maxInt(u32),
+};
+
+fn stepPushA(ctx: *StepIds, bit_id: u32) bool {
+    ctx.active[ctx.na] = bit_id;
+    ctx.na += 1;
+    return ctx.na + ctx.ni < ctx.stop_after;
+}
+
+fn stepPushI(ctx: *StepIds, bit_id: u32) bool {
+    ctx.inactive[ctx.ni] = bit_id;
+    ctx.ni += 1;
+    return ctx.na + ctx.ni < ctx.stop_after;
+}
+
+fn stepCollectAll(comptime Word: type, bs: *BitSet(Word), ctx: *StepIds) bool {
+    const It = BitSet(Word).Iterator(*StepIds, stepPushA, stepPushI);
+    var wid: u32 = 0;
+    while (wid < bs.words.items.len) : (wid += 1) {
+        if (!It.step(.{ .bitset = bs, .context = ctx }, wid)) return false;
+    }
+    return true;
+}
+
+fn stepOracleIds(comptime Word: type, bs: *const BitSet(Word), target: BitState, out: *[256]u32) usize {
+    const BW = bit_word.BitWord(Word);
+    var n: usize = 0;
+    var i: u32 = 0;
+    while (i < bs.bits_count) : (i += 1) {
+        const wid: usize = @intCast(BW.bitToWordId(i));
+        if (BW.readBitState(bs.words.items[wid], BW.bitIdInWord(i)) == target) {
+            out[n] = i;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn stepCheckOne(comptime Word: type, n: u32, pat: ResizePattern) !void {
+    const BW = bit_word.BitWord(Word);
+    var bs = BitSet(Word){};
+    defer bs.deinit(t.allocator);
+    try bs.resize(t.allocator, n, .inactive);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        bs.setBit(i, patternBit(pat, i));
+    }
+
+    if (n > 0) {
+        const used = BW.bitIdInWord(n);
+        const valid: Word = if (used == 0) std.math.maxInt(Word) else BW.maskStart(used);
+        bs.words.items[bs.words.items.len - 1] |= ~valid;
+    }
+
+    var ctx = StepIds{};
+    try t.expect(stepCollectAll(Word, &bs, &ctx));
+
+    var exp_a: [256]u32 = undefined;
+    var exp_i: [256]u32 = undefined;
+    const n_a = stepOracleIds(Word, &bs, .active, &exp_a);
+    const n_i = stepOracleIds(Word, &bs, .inactive, &exp_i);
+
+    try t.expectEqualSlices(u32, exp_a[0..n_a], ctx.active[0..ctx.na]);
+    try t.expectEqualSlices(u32, exp_i[0..n_i], ctx.inactive[0..ctx.ni]);
+
+    try t.expectEqual(n, @as(u32, @intCast(ctx.na + ctx.ni)));
+}
+
+test "BitSet step: active/inactive counts + corners" {
+    const sizes = [_]u32{ 0, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 70, 127, 128, 129, 200 };
+    const patterns = [_]ResizePattern{ .zero, .one, .alt01, .alt10, .every3, .pseudo };
+    for (sizes) |n| {
+        for (patterns) |pat| {
+            try stepCheckOne(u64, n, pat);
+            try stepCheckOne(u8, n, pat);
+        }
+    }
+}
+
+test "BitSet step: null side is skipped" {
+    {
+        var bs = BitSet(u64){};
+        defer bs.deinit(t.allocator);
+        try bs.resize(t.allocator, 70, .inactive);
+        bs.setBit(5, .active);
+        bs.setBit(69, .active);
+        const It = BitSet(u64).Iterator(*StepIds, stepPushA, null);
+        var ctx = StepIds{};
+        try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 0));
+        try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 1));
+        try t.expectEqualSlices(u32, &[_]u32{ 5, 69 }, ctx.active[0..ctx.na]);
+        try t.expectEqual(@as(usize, 0), ctx.ni);
+    }
+
+    {
+        var bs = BitSet(u8){};
+        defer bs.deinit(t.allocator);
+        try bs.resize(t.allocator, 10, .active);
+        bs.setBit(3, .inactive);
+        const It = BitSet(u8).Iterator(*StepIds, null, stepPushI);
+        var ctx = StepIds{};
+        try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 0));
+        try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 1));
+        try t.expectEqualSlices(u32, &[_]u32{3}, ctx.inactive[0..ctx.ni]);
+        try t.expectEqual(@as(usize, 0), ctx.na);
+    }
+}
+
+test "BitSet step: early exit stops the walk" {
+    {
+        var bs = BitSet(u64){};
+        defer bs.deinit(t.allocator);
+        try bs.resize(t.allocator, 70, .active);
+        const It = BitSet(u64).Iterator(*StepIds, stepPushA, stepPushI);
+        var ctx = StepIds{ .stop_after = 3 };
+        try t.expect(!It.step(.{ .bitset = &bs, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 3), ctx.na);
+        try t.expectEqual(@as(usize, 0), ctx.ni);
+        try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ctx.active[0..ctx.na]);
+    }
+
+    {
+        var bs = BitSet(u64){};
+        defer bs.deinit(t.allocator);
+        try bs.resize(t.allocator, 10, .inactive);
+        bs.setBit(0, .active);
+        bs.setBit(9, .active);
+        const It = BitSet(u64).Iterator(*StepIds, stepPushA, stepPushI);
+        var ctx = StepIds{ .stop_after = 4 };
+
+        try t.expect(!It.step(.{ .bitset = &bs, .context = &ctx }, 0));
+        try t.expectEqualSlices(u32, &[_]u32{ 0, 9 }, ctx.active[0..ctx.na]);
+        try t.expectEqualSlices(u32, &[_]u32{ 1, 2 }, ctx.inactive[0..ctx.ni]);
+    }
+
+    {
+        var bs = BitSet(u64){};
+        defer bs.deinit(t.allocator);
+        try bs.resize(t.allocator, 130, .active);
+        const It = BitSet(u64).Iterator(*StepIds, stepPushA, stepPushI);
+        var ctx = StepIds{ .stop_after = 70 };
+        try t.expect(It.step(.{ .bitset = &bs, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 64), ctx.na);
+        try t.expect(!It.step(.{ .bitset = &bs, .context = &ctx }, 1));
+        try t.expectEqual(@as(usize, 70), ctx.na);
+        try t.expectEqual(@as(u32, 64), ctx.active[64]);
+        try t.expectEqual(@as(u32, 69), ctx.active[69]);
+    }
+
+    {
+        var bs = BitSet(u64){};
+        defer bs.deinit(t.allocator);
+        try bs.resize(t.allocator, 10, .active);
+        const It = BitSet(u64).Iterator(*StepIds, stepPushA, stepPushI);
+        var ctx = StepIds{ .stop_after = 1 };
+        try t.expect(!It.step(.{ .bitset = &bs, .context = &ctx }, 0));
+        try t.expectEqual(@as(usize, 1), ctx.na);
+    }
 }

@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "cppvsdbg",
+      "request": "launch",
+      "name": "Debug Zig test (active file)",
+      "program": "${workspaceFolder}/zig-out/debug/${fileBasenameNoExtension}_test.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "zig: build active file test"
+    }
+  ]
+}
