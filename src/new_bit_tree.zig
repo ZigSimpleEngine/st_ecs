@@ -6,6 +6,7 @@ const BitSet = @import("bit_set.zig").BitSet;
 const Layer = @import("layer.zig").Layer;
 
 const IteratorCallback = utilities.IteratorCallback;
+const InlineIteratorCallback = utilities.InlineIteratorCallback;
 const Allocator = std.mem.Allocator;
 const ListA64 = utilities.ListA64;
 const BitState = utilities.BitState;
@@ -32,8 +33,8 @@ pub fn BitTree(Word: type) type {
 
         pub fn Iterator(
             comptime Context: type,
-            comptime on_active: IteratorCallback(Context),
-            comptime on_inactive: IteratorCallback(Context),
+            comptime on_active: InlineIteratorCallback(Context),
+            comptime on_inactive: InlineIteratorCallback(Context),
         ) type {
             return struct {
                 const L = Layer(Word);
@@ -55,65 +56,77 @@ pub fn BitTree(Word: type) type {
                     context: Context,
                 });
 
-                fn ActivityUnwrapper(comptime callback: IteratorCallback(Context)) type {
+                fn ActivityUnwrapper(comptime callback: InlineIteratorCallback(Context)) type {
                     return struct {
                         inline fn unwrap(data: *LayerWithContext, word_id: u32) bool {
                             const layer_id = data.context.layer_id;
                             const context = data.context.context;
                             const end_word_id = word_id + 1;
-                            const shift: bw.Shift = @truncate(bw.shift_type_bits * layer_id);
-                            const start_bit_id = word_id << shift;
-                            const end_bit_id = end_word_id << shift;
+                            const shift: u32 = bw.shift_type_bits * layer_id;
+                            const s5: u5 = @truncate(shift);
+                            const start_bit_id = word_id << s5;
+                            var end_bit_id = end_word_id << s5;
+                            const total = data.tree.bitset.bits_count;
+                            if (end_bit_id > total) end_bit_id = total;
+                            if (start_bit_id >= total) return true;
 
                             for (start_bit_id..end_bit_id) |i| {
                                 if (callback) |f| {
                                     if (!f(context, @truncate(i))) return false;
                                 }
                             }
+                            return true;
                         }
                     };
                 }
 
                 fn mixed_unwrapper(data: *LayerWithContext, word_id: u32) bool {
                     data.context.layer_id -= 1;
-                    const end_word_id = word_id + 1;
-                    const start_bit_id = word_id << bw.shift_type_bits;
-                    const end_bit_id = end_word_id << bw.shift_type_bits;
-
-                    for (start_bit_id..end_bit_id) |i| {
-                        LI.step(data, @truncate(i));
-                    }
+                    const lower = &data.tree.layers.items[data.context.layer_id];
+                    const ok = LI.step(.{ .layer = lower, .context = data }, word_id);
+                    data.context.layer_id += 1;
+                    if (!ok) return false;
+                    return true;
                 }
 
                 inline fn deep_mixed_unwrapper(data: *LayerWithContext, word_id: u32) bool {
                     const layer_id = data.context.layer_id;
                     const end_word_id = word_id + 1;
-                    const shift: bw.Shift = @truncate(bw.shift_type_bits * (layer_id - 1));
-                    const start_bit_id = word_id << shift;
-                    const end_bit_id = end_word_id << shift;
+                    const shift: u32 = bw.shift_type_bits * (layer_id - 1);
+                    const s5: u5 = @truncate(shift);
+                    const start_bit_id = word_id << s5;
+                    var end_bit_id = end_word_id << s5;
+                    const words_len: u32 = @truncate(data.tree.bitset.words.items.len);
+                    if (end_bit_id > words_len) end_bit_id = words_len;
+                    if (start_bit_id >= words_len) return true;
 
                     const BI = B.Iterator(Context, on_active, on_inactive);
                     const bi_data: B.BitsetWithContext(Context) = .{
-                        .bitset = data.tree.bitset,
+                        .bitset = &data.tree.bitset,
                         .context = data.context.context,
                     };
                     for (start_bit_id..end_bit_id) |i| {
                         if (!BI.step(bi_data, @truncate(i))) return false;
                     }
+                    return true;
                 }
 
                 pub inline fn step(data: TreeWithContext(Context)) bool {
                     const layers = data.tree.layers.items;
+                    if (layers.len == 0) return true;
                     var context: LayerWithContext = .{
                         .context = .{
                             .context = data.context,
-                            .layer_id = layers.len,
+                            .layer_id = @truncate(layers.len - 1),
                         },
                         .tree = data.tree,
                     };
 
-                    for (layers, 0..) |_, i| {
-                        if (!LI.step(&context, i)) return false;
+                    const top = &data.tree.layers.items[layers.len - 1];
+                    const words: u32 = @truncate(top.activity.items.len);
+                    var wid: u32 = 0;
+                    while (wid < words) : (wid += 1) {
+                        if (!LI.step(.{ .layer = top, .context = &context }, wid)) return false;
                     }
 
                     return true;
@@ -236,13 +249,13 @@ const TreeStepIds = struct {
     }
 };
 
-fn treePushA(ctx: *TreeStepIds, bit_id: u32) bool {
+inline fn treePushA(ctx: *TreeStepIds, bit_id: u32) bool {
     ctx.active[ctx.na] = bit_id;
     ctx.na += 1;
     return ctx.total() < ctx.stop_after;
 }
 
-fn treePushI(ctx: *TreeStepIds, bit_id: u32) bool {
+inline fn treePushI(ctx: *TreeStepIds, bit_id: u32) bool {
     ctx.inactive[ctx.ni] = bit_id;
     ctx.ni += 1;
     return ctx.total() < ctx.stop_after;
@@ -452,6 +465,8 @@ fn treeStepCheckOne(comptime Word: type, n: u32, active_every: u32, active_offse
     var exp_i: [512]u32 = undefined;
     const n_a = treeOracleIds(Word, &tree, .active, &exp_a);
     const n_i = treeOracleIds(Word, &tree, .inactive, &exp_i);
+    std.mem.sort(u32, ctx.active[0..ctx.na], {}, std.sort.asc(u32));
+    std.mem.sort(u32, ctx.inactive[0..ctx.ni], {}, std.sort.asc(u32));
     try t.expectEqualSlices(u32, exp_a[0..n_a], ctx.active[0..ctx.na]);
     try t.expectEqualSlices(u32, exp_i[0..n_i], ctx.inactive[0..ctx.ni]);
     try t.expectEqual(n, @as(u32, @intCast(ctx.na + ctx.ni)));
@@ -481,6 +496,8 @@ test "BitTree step: early exit" {
         try t.expectEqualSlices(u32, &[_]u32{ 0, 1, 2 }, ctx.active[0..ctx.na]);
     }
     // Остановка во втором регионе (смешанное дерево).
+    // Порядок обхода не гарантируется: проверяем только факт ранней
+    // остановки, общее число вызовов и корректность самих id.
     {
         var tree = BitTree(u64){};
         defer tree.deinit(t.allocator);
@@ -488,11 +505,22 @@ test "BitTree step: early exit" {
         tree.setBit(100, .active);
         const It = BitTree(u64).Iterator(*TreeStepIds, treePushA, treePushI);
         var ctx = TreeStepIds{ .stop_after = 65 };
-        // 64 inactive бита слова 0, затем бит 100.
         try t.expect(!It.step(.{ .tree = &tree, .context = &ctx }));
-        try t.expectEqual(@as(usize, 64), ctx.ni);
-        try t.expectEqual(@as(usize, 1), ctx.na);
-        try t.expectEqual(@as(u32, 100), ctx.active[0]);
+        try t.expectEqual(@as(usize, 65), ctx.na + ctx.ni);
+        // Все отданные id валидны, без дублей и с правильным состоянием.
+        var seen: [130]bool = [_]bool{false} ** 130;
+        for (ctx.active[0..ctx.na]) |id| {
+            try t.expect(id < 130);
+            try t.expect(!seen[id]);
+            seen[id] = true;
+            try t.expectEqual(@as(u32, 100), id);
+        }
+        for (ctx.inactive[0..ctx.ni]) |id| {
+            try t.expect(id < 130);
+            try t.expect(!seen[id]);
+            seen[id] = true;
+            try t.expect(id != 100);
+        }
     }
     // stop_after = 1: ровно один вызов и остановка.
     {
@@ -521,6 +549,7 @@ test "BitTree step: null side skips opposite uniform regions" {
         try t.expectEqual(@as(usize, 0), ctx.ni);
     }
     // Только inactive: бит 100 (active) не виден, остальные 129 на месте.
+    // Порядок не гарантируется: сортируем копию перед сверкой границ.
     {
         var tree = BitTree(u64){};
         defer tree.deinit(t.allocator);
@@ -531,6 +560,7 @@ test "BitTree step: null side skips opposite uniform regions" {
         try t.expect(It.step(.{ .tree = &tree, .context = &ctx }));
         try t.expectEqual(@as(usize, 129), ctx.ni);
         try t.expectEqual(@as(usize, 0), ctx.na);
+        std.mem.sort(u32, ctx.inactive[0..ctx.ni], {}, std.sort.asc(u32));
         try t.expectEqual(@as(u32, 0), ctx.inactive[0]);
         try t.expectEqual(@as(u32, 129), ctx.inactive[128]);
     }
@@ -590,13 +620,13 @@ const StepTotals = struct {
     ni: usize = 0,
 };
 
-fn totalPushA(ctx: *StepTotals, bit_id: u32) bool {
+inline fn totalPushA(ctx: *StepTotals, bit_id: u32) bool {
     _ = bit_id;
     ctx.na += 1;
     return true;
 }
 
-fn totalPushI(ctx: *StepTotals, bit_id: u32) bool {
+inline fn totalPushI(ctx: *StepTotals, bit_id: u32) bool {
     _ = bit_id;
     ctx.ni += 1;
     return true;

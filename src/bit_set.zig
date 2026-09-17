@@ -4,8 +4,8 @@ const bit_word = @import("bit_word.zig");
 const Allocator = std.mem.Allocator;
 const ListA64 = utilities.ListA64;
 
-const IteratorCallback = utilities.IteratorCallback;
-const iterateActiveBitsInWord = utilities.iterateActiveBitsInWord;
+const InlineIteratorCallback = utilities.InlineIteratorCallback;
+const iterateActiveBitsInWordInline = utilities.iterateActiveBitsInWordInline;
 const BitRange = utilities.BitRange;
 const BitState = utilities.BitState;
 
@@ -32,8 +32,8 @@ pub fn BitSet(comptime Word: type) type {
 
         pub fn Iterator(
             comptime Context: type,
-            comptime on_active: IteratorCallback(Context),
-            comptime on_inactive: IteratorCallback(Context),
+            comptime on_active: InlineIteratorCallback(Context),
+            comptime on_inactive: InlineIteratorCallback(Context),
         ) type {
             return struct {
                 pub inline fn step(data: BitsetWithContext(Context), word_id: u32) bool {
@@ -52,7 +52,7 @@ pub fn BitSet(comptime Word: type) type {
                     }
 
                     if (on_active) |f| {
-                        if (!iterateActiveBitsInWord(
+                        if (!iterateActiveBitsInWordInline(
                             Word,
                             Context,
                             f,
@@ -63,7 +63,7 @@ pub fn BitSet(comptime Word: type) type {
                     }
 
                     if (on_inactive) |f| {
-                        if (!iterateActiveBitsInWord(
+                        if (!iterateActiveBitsInWordInline(
                             Word,
                             Context,
                             f,
@@ -705,13 +705,13 @@ const StepIds = struct {
     stop_after: u32 = std.math.maxInt(u32),
 };
 
-fn stepPushA(ctx: *StepIds, bit_id: u32) bool {
+inline fn stepPushA(ctx: *StepIds, bit_id: u32) bool {
     ctx.active[ctx.na] = bit_id;
     ctx.na += 1;
     return ctx.na + ctx.ni < ctx.stop_after;
 }
 
-fn stepPushI(ctx: *StepIds, bit_id: u32) bool {
+inline fn stepPushI(ctx: *StepIds, bit_id: u32) bool {
     ctx.inactive[ctx.ni] = bit_id;
     ctx.ni += 1;
     return ctx.na + ctx.ni < ctx.stop_after;

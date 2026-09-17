@@ -13,12 +13,14 @@
 /// zig build bench -Doptimize=ReleaseFast
 const std = @import("std");
 const bit_tree = @import("bit_tree.zig");
+const new_bit_tree = @import("new_bit_tree.zig");
 const p9 = @import("iteration_tests/p9.zig");
 
 const Allocator = std.mem.Allocator;
 const FlatBitSet = bit_tree.FlatBitSet;
 const BitState = bit_tree.BitState;
 const BitTree = bit_tree.BitTree;
+const NewTree = new_bit_tree.BitTree(u64);
 
 const Stopwatch = struct {
     io: std.Io,
@@ -36,6 +38,13 @@ fn fillStride(bits: anytype, stride: u32, offset: u32) void {
     var b: u32 = offset;
     while (b < bits.totalBitsCount()) : (b += stride) {
         bits.set(b, .active);
+    }
+}
+
+fn fillNewStride(tree: *NewTree, stride: u32, offset: u32) void {
+    var b: u32 = offset;
+    while (b < tree.bitset.bits_count) : (b += stride) {
+        tree.setBit(b, .active);
     }
 }
 
@@ -128,6 +137,11 @@ const SumCtx = struct {
         self.count += 1;
         return true;
     }
+    inline fn addInline(self: *SumCtx, id: u32) bool {
+        self.sum += id;
+        self.count += 1;
+        return true;
+    }
 };
 
 /// New algorithm: comptime iterator chain streams ids straight into `add`.
@@ -143,6 +157,28 @@ fn benchTreeForEach(io: std.Io, tree: *const BitTree, comptime want: BitState, r
             tree.iterateTargetBits(*SumCtx, &c, SumCtx.add, null)
         else
             tree.iterateTargetBits(*SumCtx, &c, null, SumCtx.add);
+        std.mem.doNotOptimizeAway(done);
+        sum += c.sum;
+        count += c.count;
+    }
+    return .{ .sum = sum, .count = count, .ns = watch.read() };
+}
+
+/// New-tree leg: new_bit_tree Iterator streams ids straight into `add`.
+/// No output arrays, no sorting (sum is order-independent).
+fn benchNewTreeForEach(io: std.Io, tree: *NewTree, comptime want: BitState, reps: u32) struct { sum: u64, count: u64, ns: u64 } {
+    var watch = Stopwatch.start(io);
+    var sum: u64 = 0;
+    var count: u64 = 0;
+    var r: u32 = 0;
+    while (r < reps) : (r += 1) {
+        var c = SumCtx{};
+        const It = NewTree.Iterator(*SumCtx, SumCtx.addInline, null);
+        const ItI = NewTree.Iterator(*SumCtx, null, SumCtx.addInline);
+        const done = if (want == .active)
+            It.step(.{ .tree = tree, .context = &c })
+        else
+            ItI.step(.{ .tree = tree, .context = &c });
         std.mem.doNotOptimizeAway(done);
         sum += c.sum;
         count += c.count;
@@ -176,20 +212,20 @@ fn benchArithPair(io: std.Io, alloc: Allocator, name: []const u8, tree: *const B
     const fl = benchFlatSum(io, flat, .active, reps);
     const tr = benchTreeArith(io, tree, reps);
     std.debug.assert(fl.sum == tr.sum and fl.count == tr.count);
-    printRow(name, fl.count / reps, @as(f64, @floatFromInt(fl.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(tr.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, std.math.nan(f64));
+    printRow(name, fl.count / reps, @as(f64, @floatFromInt(fl.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(tr.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, std.math.nan(f64), std.math.nan(f64));
 }
 fn printHeader() void {
-    std.debug.print("{s:<26} {s:>10} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "pattern", "elements", "flat(ms)", "new(ms)", "p9(ms)", "xFlat" });
-    std.debug.print("{s:<26} {s:>10} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "--------------------------", "----------", "----------", "----------", "----------", "--------" });
+    std.debug.print("{s:<26} {s:>10} {s:>10} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "pattern", "elements", "flat(ms)", "new(ms)", "p9(ms)", "ntree(ms)", "xFlat" });
+    std.debug.print("{s:<26} {s:>10} {s:>10} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "--------------------------", "----------", "----------", "----------", "----------", "----------", "--------" });
 }
 
-fn printRow(name: []const u8, elements: u64, ms_flat: f64, ms_new: f64, ms_p9: f64) void {
+fn printRow(name: []const u8, elements: u64, ms_flat: f64, ms_new: f64, ms_p9: f64, ms_ntree: f64) void {
     const x: f64 = if (ms_new > 0) ms_flat / ms_new else 0;
-    std.debug.print("{s:<26} {d:>10} {d:>10.3} {d:>10.3} {d:>10.3} {d:>7.2}x\n", .{ name, elements, ms_flat, ms_new, ms_p9, x });
+    std.debug.print("{s:<26} {d:>10} {d:>10.3} {d:>10.3} {d:>10.3} {d:>10.3} {d:>7.2}x\n", .{ name, elements, ms_flat, ms_new, ms_p9, ms_ntree, x });
 }
 
 /// One scenario on identical flat/tree contents. No output arrays anywhere.
-fn benchPair(io: std.Io, alloc: Allocator, name: []const u8, tree: *const BitTree, flat: *const FlatBitSet, comptime want: BitState, reps: u32) !void {
+fn benchPair(io: std.Io, alloc: Allocator, name: []const u8, tree: *const BitTree, flat: *const FlatBitSet, ntree: *NewTree, comptime want: BitState, reps: u32) !void {
     _ = alloc;
     // Warmup once (page in memory, branch predictors) outside the clock.
     {
@@ -200,12 +236,24 @@ fn benchPair(io: std.Io, alloc: Allocator, name: []const u8, tree: *const BitTre
             tree.iterateTargetBits(*SumCtx, &c, null, SumCtx.add);
         std.mem.doNotOptimizeAway(done);
     }
+    {
+        var c = SumCtx{};
+        const It = NewTree.Iterator(*SumCtx, SumCtx.addInline, null);
+        const ItI = NewTree.Iterator(*SumCtx, null, SumCtx.addInline);
+        const done = if (want == .active)
+            It.step(.{ .tree = ntree, .context = &c })
+        else
+            ItI.step(.{ .tree = ntree, .context = &c });
+        std.mem.doNotOptimizeAway(done);
+    }
     const fl = benchFlatSum(io, flat, want, reps);
     const tr = benchTreeForEach(io, tree, want, reps);
     const p9r = benchP9Sum(io, flat, want, reps);
+    const ntr = benchNewTreeForEach(io, ntree, want, reps);
     std.debug.assert(fl.sum == tr.sum and fl.count == tr.count);
     std.debug.assert(fl.sum == p9r.sum and fl.count == p9r.count);
-    printRow(name, fl.count / reps, @as(f64, @floatFromInt(fl.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(tr.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(p9r.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0);
+    std.debug.assert(fl.sum == ntr.sum and fl.count == ntr.count);
+    printRow(name, fl.count / reps, @as(f64, @floatFromInt(fl.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(tr.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(p9r.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0, @as(f64, @floatFromInt(ntr.ns)) / @as(f64, @floatFromInt(reps)) / 1_000_000.0);
 }
 
 fn benchThresholdPair(io: std.Io, alloc: Allocator, bits_total: u32, stride: u32, reps: u32) !void {
@@ -213,13 +261,20 @@ fn benchThresholdPair(io: std.Io, alloc: Allocator, bits_total: u32, stride: u32
     defer tree.deinit(alloc);
     var flat = FlatBitSet.empty;
     defer flat.deinit(alloc);
+    var ntree = NewTree{};
+    defer ntree.deinit(alloc);
     try tree.resize(alloc, bits_total, .inactive);
     try flat.resize(alloc, bits_total, .inactive);
+    try ntree.resize(alloc, bits_total, .inactive);
     fillStride(&tree, stride, 0);
     fillStride(&flat, stride, 0);
+    var b: u32 = 0;
+    while (b < bits_total) : (b += stride) {
+        ntree.setBit(b, .active);
+    }
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "gap{d}-N{d}", .{ stride, bits_total });
-    try benchPair(io, alloc, name, &tree, &flat, .active, reps);
+    try benchPair(io, alloc, name, &tree, &flat, &ntree, .active, reps);
 }
 
 /// Write path: fresh tree + per-bit `set` calls. Exercises propagate.
@@ -251,13 +306,26 @@ fn benchClusterPair(io: std.Io, alloc: Allocator, bits_total: u32, run: u32, gap
     defer tree.deinit(alloc);
     var flat = FlatBitSet.empty;
     defer flat.deinit(alloc);
+    var ntree = NewTree{};
+    defer ntree.deinit(alloc);
     try tree.resize(alloc, bits_total, .inactive);
     try flat.resize(alloc, bits_total, .inactive);
+    try ntree.resize(alloc, bits_total, .inactive);
     fillClustered(&tree, run, gap, 0);
     fillClustered(&flat, run, gap, 0);
+    const total: u64 = bits_total;
+    var b: u64 = 0;
+    while (b < total) {
+        const end: u64 = @min(b + run, total);
+        var i: u32 = @intCast(b);
+        while (i < end) : (i += 1) {
+            ntree.setBit(i, .active);
+        }
+        b = end + gap;
+    }
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "cluster-r{d}-g{d}-N{d}", .{ run, gap, bits_total });
-    try benchPair(io, alloc, name, &tree, &flat, .active, reps);
+    try benchPair(io, alloc, name, &tree, &flat, &ntree, .active, reps);
     const aname = try std.fmt.bufPrint(&name_buf, "cluster-r{d}-g{d}-N{d}-arith", .{ run, gap, bits_total });
     try benchArithPair(io, alloc, aname, &tree, &flat, reps);
 }
@@ -306,15 +374,34 @@ pub fn main(init: std.process.Init) !void {
     try ultra_tree.resize(alloc, 10_000_000, .inactive);
     fillStride(&ultra_tree, 100_003, 7);
 
+    var sparse_ntree = NewTree{};
+    defer sparse_ntree.deinit(alloc);
+    try sparse_ntree.resize(alloc, 1_000_000, .inactive);
+    fillNewStride(&sparse_ntree, 997, 1);
+
+    var dense_ntree = NewTree{};
+    defer dense_ntree.deinit(alloc);
+    try dense_ntree.resize(alloc, 100_000, .active);
+
+    var strided_ntree = NewTree{};
+    defer strided_ntree.deinit(alloc);
+    try strided_ntree.resize(alloc, 200_000, .inactive);
+    fillNewStride(&strided_ntree, 3, 0);
+
+    var ultra_ntree = NewTree{};
+    defer ultra_ntree.deinit(alloc);
+    try ultra_ntree.resize(alloc, 10_000_000, .inactive);
+    fillNewStride(&ultra_ntree, 100_003, 7);
+
     printHeader();
-    try benchPair(io, alloc, "sparse1M", &sparse_tree, &sparse, .active, 500);
+    try benchPair(io, alloc, "sparse1M", &sparse_tree, &sparse, &sparse_ntree, .active, 500);
     try benchArithPair(io, alloc, "sparse1M-arith", &sparse_tree, &sparse, 500);
-    try benchPair(io, alloc, "sparse1M-inactive", &sparse_tree, &sparse, .inactive, 5);
-    try benchPair(io, alloc, "dense100k", &dense_tree, &dense, .active, 20);
+    try benchPair(io, alloc, "sparse1M-inactive", &sparse_tree, &sparse, &sparse_ntree, .inactive, 5);
+    try benchPair(io, alloc, "dense100k", &dense_tree, &dense, &dense_ntree, .active, 20);
     try benchArithPair(io, alloc, "dense100k-arith", &dense_tree, &dense, 20);
-    try benchPair(io, alloc, "every3rd200k", &strided_tree, &strided, .active, 20);
+    try benchPair(io, alloc, "every3rd200k", &strided_tree, &strided, &strided_ntree, .active, 20);
     try benchArithPair(io, alloc, "every3rd200k-arith", &strided_tree, &strided, 20);
-    try benchPair(io, alloc, "ultra10M", &ultra_tree, &ultra, .active, 200);
+    try benchPair(io, alloc, "ultra10M", &ultra_tree, &ultra, &ultra_ntree, .active, 200);
     try benchArithPair(io, alloc, "ultra10M-arith", &ultra_tree, &ultra, 200);
 
     const strides = [_]u32{ 1, 2, 4, 8, 16, 64, 256, 1024, 4096, 16384, 65536 };

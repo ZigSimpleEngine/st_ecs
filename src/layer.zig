@@ -6,7 +6,9 @@ const Allocator = std.mem.Allocator;
 const ListA64 = utilities.ListA64;
 
 const IteratorCallback = utilities.IteratorCallback;
+const InlineIteratorCallback = utilities.InlineIteratorCallback;
 const iterateWord = utilities.iterateActiveBitsInWord;
+const iterateWordInline = utilities.iterateActiveBitsInWordInline;
 const BitState = utilities.BitState;
 
 pub fn Layer(comptime Word: type) type {
@@ -68,10 +70,10 @@ pub fn Layer(comptime Word: type) type {
 
         pub fn Iterator(
             comptime Context: type,
-            comptime on_inactive: IteratorCallback(Context),
-            comptime on_active: IteratorCallback(Context),
+            comptime on_inactive: InlineIteratorCallback(Context),
+            comptime on_active: InlineIteratorCallback(Context),
             comptime on_mixed: IteratorCallback(Context),
-            comptime on_deep_mixed: IteratorCallback(Context),
+            comptime on_deep_mixed: InlineIteratorCallback(Context),
         ) type {
             return struct {
                 pub inline fn step(data: LayerWithContext(Context), word_id: u32) bool {
@@ -94,7 +96,7 @@ pub fn Layer(comptime Word: type) type {
 
                     if (on_inactive) |f| {
                         const only_inactive_word = inv_activity_word & inv_mixed_word & mask;
-                        if (!iterateWord(
+                        if (!iterateWordInline(
                             Word,
                             Context,
                             f,
@@ -106,7 +108,7 @@ pub fn Layer(comptime Word: type) type {
 
                     if (on_active) |f| {
                         const only_active_word = activity_word & inv_mixed_word & mask;
-                        if (!iterateWord(
+                        if (!iterateWordInline(
                             Word,
                             Context,
                             f,
@@ -130,7 +132,7 @@ pub fn Layer(comptime Word: type) type {
 
                     if (on_deep_mixed) |f| {
                         const only_deep_mixed = activity_word & mixed_word & mask;
-                        if (!iterateWord(
+                        if (!iterateWordInline(
                             Word,
                             Context,
                             f,
@@ -534,13 +536,13 @@ const StepStates = struct {
     }
 };
 
-fn stepPushI(ctx: *StepStates, bit_id: u32) bool {
+inline fn stepPushI(ctx: *StepStates, bit_id: u32) bool {
     ctx.inactive[ctx.ni] = bit_id;
     ctx.ni += 1;
     return ctx.total() < ctx.stop_after;
 }
 
-fn stepPushA(ctx: *StepStates, bit_id: u32) bool {
+inline fn stepPushA(ctx: *StepStates, bit_id: u32) bool {
     ctx.active[ctx.na] = bit_id;
     ctx.na += 1;
     return ctx.total() < ctx.stop_after;
@@ -552,7 +554,7 @@ fn stepPushM(ctx: *StepStates, bit_id: u32) bool {
     return ctx.total() < ctx.stop_after;
 }
 
-fn stepPushD(ctx: *StepStates, bit_id: u32) bool {
+inline fn stepPushD(ctx: *StepStates, bit_id: u32) bool {
     ctx.deep[ctx.nd] = bit_id;
     ctx.nd += 1;
     return ctx.total() < ctx.stop_after;

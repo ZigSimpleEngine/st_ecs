@@ -12,6 +12,10 @@ pub fn IteratorCallback(Context: type) type {
     return ?fn (context: Context, bit_id: u32) bool;
 }
 
+pub fn InlineIteratorCallback(Context: type) type {
+    return ?fn (context: Context, bit_id: u32) callconv(.@"inline") bool;
+}
+
 pub fn assertUnsignedPowerOfTwoInt(comptime T: type) void {
     const info = @typeInfo(T);
 
@@ -35,6 +39,27 @@ pub inline fn iterateActiveBitsInWord(
     comptime Word: type,
     comptime Context: type,
     comptime callback: fn (context: Context, bit_id: u32) bool,
+    context: Context,
+    start_bit_id: u32,
+    word: Word,
+) bool {
+    comptime {
+        assertUnsignedPowerOfTwoInt(Word);
+    }
+
+    var w = word;
+    while (w != 0) {
+        const i: u32 = @ctz(w);
+        if (!callback(context, start_bit_id + i)) return false;
+        w &= w - 1;
+    }
+    return true;
+}
+
+pub inline fn iterateActiveBitsInWordInline(
+    comptime Word: type,
+    comptime Context: type,
+    comptime callback: fn (context: Context, bit_id: u32) callconv(.@"inline") bool,
     context: Context,
     start_bit_id: u32,
     word: Word,
