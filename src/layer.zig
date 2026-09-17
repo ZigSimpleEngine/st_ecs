@@ -5,6 +5,7 @@ const bit_word = @import("bit_word.zig");
 const Allocator = std.mem.Allocator;
 const ListA64 = utilities.ListA64;
 
+const IteratorCallback = utilities.IteratorCallback;
 const iterateWord = utilities.iterateActiveBitsInWord;
 const BitState = utilities.BitState;
 
@@ -58,20 +59,22 @@ pub fn Layer(comptime Word: type) type {
 
         pub const StateCounts = struct { inactive: u32, active: u32, mixed: u32, deep: u32 };
 
+        pub fn LayerWithContext(Context: type) type {
+            return struct {
+                layer: *Self,
+                context: Context,
+            };
+        }
+
         pub fn Iterator(
             comptime Context: type,
-            comptime on_inactive: ?fn (context: Context, bit_id: u32) bool,
-            comptime on_active: ?fn (context: Context, bit_id: u32) bool,
-            comptime on_mixed: ?fn (context: Context, bit_id: u32) bool,
-            comptime on_deep_mixed: ?fn (context: Context, bit_id: u32) bool,
+            comptime on_inactive: IteratorCallback(Context),
+            comptime on_active: IteratorCallback(Context),
+            comptime on_mixed: IteratorCallback(Context),
+            comptime on_deep_mixed: IteratorCallback(Context),
         ) type {
             return struct {
-                pub const LayerWithContext = struct {
-                    layer: *Self,
-                    context: Context,
-                };
-
-                pub inline fn step(data: LayerWithContext, word_id: u32) bool {
+                pub inline fn step(data: LayerWithContext(Context), word_id: u32) bool {
                     const layer = data.layer;
                     const context = data.context;
                     std.debug.assert(word_id < layer.activity.items.len);
@@ -187,6 +190,32 @@ pub fn Layer(comptime Word: type) type {
             self.state_counters[State.active_u32] = self.state_counters[State.active_u32] - o.active + n.active;
             self.state_counters[State.mixed_u32] = self.state_counters[State.mixed_u32] - o.mixed + n.mixed;
             self.state_counters[State.deep_mixed_u32] = self.state_counters[State.deep_mixed_u32] - o.deep + n.deep;
+        }
+
+        pub fn setBit(self: *Self, id: u32, value: State) void {
+            std.debug.assert(id < self.bits_count);
+            const word_id = bw.bitToWordId(id);
+            const bit_id_in_word = bw.bitIdInWord(id);
+            const old_a: Word = self.activity.items[word_id];
+            const old_m: Word = self.mixed.items[word_id];
+            const old_value = State.fromBits(
+                bw.readBitState(old_a, bit_id_in_word),
+                bw.readBitState(old_m, bit_id_in_word),
+            );
+            if (old_value == value) return;
+            const bit: Word = @as(Word, 1) << bit_id_in_word;
+            if (value.activityBit() == .active) {
+                self.activity.items[word_id] = old_a | bit;
+            } else {
+                self.activity.items[word_id] = old_a & ~bit;
+            }
+            if (value.mixedBit() == .active) {
+                self.mixed.items[word_id] = old_m | bit;
+            } else {
+                self.mixed.items[word_id] = old_m & ~bit;
+            }
+            self.state_counters[@intFromEnum(old_value)] -= 1;
+            self.state_counters[@intFromEnum(value)] += 1;
         }
 
         pub fn resize(

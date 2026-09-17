@@ -4,6 +4,7 @@ const bit_word = @import("bit_word.zig");
 const Allocator = std.mem.Allocator;
 const ListA64 = utilities.ListA64;
 
+const IteratorCallback = utilities.IteratorCallback;
 const iterateActiveBitsInWord = utilities.iterateActiveBitsInWord;
 const BitRange = utilities.BitRange;
 const BitState = utilities.BitState;
@@ -22,18 +23,20 @@ pub fn BitSet(comptime Word: type) type {
         bits_count: u32 = 0,
         active_bits_counter: u32 = 0,
 
+        pub fn BitsetWithContext(Context: type) type {
+            return struct {
+                bitset: *Self,
+                context: Context,
+            };
+        }
+
         pub fn Iterator(
             comptime Context: type,
-            comptime on_active: ?fn (context: Context, bit_id: u32) bool,
-            comptime on_inactive: ?fn (context: Context, bit_id: u32) bool,
+            comptime on_active: IteratorCallback(Context),
+            comptime on_inactive: IteratorCallback(Context),
         ) type {
             return struct {
-                pub const BitsetWithContext = struct {
-                    bitset: *Self,
-                    context: Context,
-                };
-
-                pub inline fn step(data: BitsetWithContext, word_id: u32) bool {
+                pub inline fn step(data: BitsetWithContext(Context), word_id: u32) bool {
                     const bitset = data.bitset;
                     const context = data.context;
                     std.debug.assert(word_id < bitset.words.items.len);

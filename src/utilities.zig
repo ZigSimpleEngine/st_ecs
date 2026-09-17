@@ -8,6 +8,10 @@ pub fn ListA64(comptime T: type) type {
     return std.array_list.Aligned(T, std.mem.Alignment.@"64");
 }
 
+pub fn IteratorCallback(Context: type) type {
+    return ?fn (context: Context, bit_id: u32) bool;
+}
+
 pub fn assertUnsignedPowerOfTwoInt(comptime T: type) void {
     const info = @typeInfo(T);
 
